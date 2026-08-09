@@ -112,6 +112,42 @@ python stock_dashboard.py
 - 安全审查清单（公网部署前必做）
 - 已知遗留问题 + 技术债登记
 
+## 自动同步到 GitHub + Gitee
+
+`tools/auto_sync.py` 监控目录变动,debounce 5 分钟后自动 commit + push 到双 remote。
+
+### 触发阈值(可在 `tools/auto_sync.py` 顶部修改)
+- `MIN_FILES = 1`  (至少 1 个文件变动)
+- `MIN_LINES = 10` (或至少 10 行 diff)
+- `DEBOUNCE_SECONDS = 300` (变动后 5 分钟无新变动才提交)
+
+### 三种使用方式
+
+**1. 一次性手动同步**
+```bash
+tools\sync_once.bat
+```
+
+**2. 后台服务(本次会话内)**
+```bash
+tools\start_sync.bat
+```
+日志:`logs\auto_sync.log`
+
+**3. Task Scheduler 开机自启(推荐)**
+用管理员权限运行 cmd:
+```bash
+tools\install_task.bat
+```
+任务名:`Stock_Dashboard_AutoSync`,触发器:`onlogon`(用户登录时启动)
+
+### 手动控制已注册任务
+```cmd
+schtasks /run  /tn "Stock_Dashboard_AutoSync"   :: 立即启动
+schtasks /end  /tn "Stock_Dashboard_AutoSync"   :: 停止当前实例
+schtasks /delete /tn "Stock_Dashboard_AutoSync"  :: 取消注册
+```
+
 ## 已知风险
 
 | 风险 | 触发 | 缓解 |

@@ -1,0 +1,134 @@
+"""
+auto_sync.py - 监控 Stock_Dashboard 目录,变动时自动 commit + push 到 GitHub + Gitee
+
+用法:
+    python tools/auto_sync.py
+    或后台: tools\install_task.bat (注册到 Task Scheduler,开机自启)
+    或单次: tools\sync_once.bat  (手动触发一次 sync)
+
+触发阈值(可改):
+    MIN_FILES = 1   # 至少 1 个文件变动
+    MIN_LINES = 10  # 或至少 10 行 diff
+DEBOUNCE_SECONDS = 300  # 文件变更后 5 分钟无新变动才触发 commit
+PUSH_REMOTES = ["github", "gitee"]
+"""
+import os
+import subprocess
+import time
+import datetime
+import sys
+
+PROJECT_DIR = r"C:\Mac\Home\Desktop\win_WorkSpace_ClaudeCode\Stock_Dashboard"
+MIN_FILES = 1
+MIN_LINES = 10
+DEBOUNCE_SECONDS = 300
+PUSH_REMOTES = ["github", "gitee"]
+CHECK_INTERVAL = 30
+LOG_FILE = os.path.join(PROJECT_DIR, "logs", "auto_sync.log")
+
+
+def log(msg):
+    line = f"[{datetime.datetime.now().strftime('%Y-%m-%d %H:%M:%S')}] {msg}"
+    print(line)
+    try:
+        os.makedirs(os.path.dirname(LOG_FILE), exist_ok=True)
+        with open(LOG_FILE, "a", encoding="utf-8") as f:
+            f.write(line + "\n")
+    except Exception:
+        pass
+
+
+def run_git(args):
+    r = subprocess.run(
+        ["git", "-C", PROJECT_DIR] + args,
+        capture_output=True, text=True, encoding="utf-8", errors="replace"
+    )
+    return r.returncode, r.stdout.strip(), r.stderr.strip()
+
+
+def get_pending_changes():
+    """返回 (file_count, line_diff, has_changes); has_changes=False 表示无变动。"""
+    code, out, _ = run_git(["status", "--porcelain"])
+    if code != 0 or not out:
+        return 0, 0, False
+    files = [l for l in out.splitlines() if l.strip()]
+    file_count = len(files)
+    # 计算 staged + unstaged 的 line diff
+    code, out, _ = run_git(["diff", "--numstat"])
+    line_diff = 0
+    for l in out.splitlines():
+        parts = l.split()
+        if len(parts) >= 2:
+            try:
+                # 'X Y file' 中的 X (added) + Y (deleted) 视为 diff
+                line_diff += int(parts[0]) + int(parts[1])
+            except ValueError:
+                pass
+    return file_count, line_diff, True
+
+
+def is_significant(file_count, line_diff):
+    return file_count >= MIN_FILES or line_diff >= MIN_LINES
+
+
+def commit_and_push():
+    file_count, line_diff, _ = get_pending_changes()
+    ts = datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    msg = f"auto-sync: {ts} ({file_count} files, {line_diff} lines)"
+    log(f"commit: {msg}")
+
+    code, _, err = run_git(["add", "-A"])
+    if code != 0:
+        log(f"add 失败: {err}")
+        return False
+    code, _, err = run_git(["commit", "-m", msg])
+    if code != 0 and "nothing to commit" not in err:
+        log(f"commit 失败: {err}")
+        return False
+    if "nothing to commit" in err:
+        log("无变动,跳过")
+        return False
+
+    for remote in PUSH_REMOTES:
+        log(f"push {remote} ...")
+        code, out, err = run_git(["push", remote, "main"])
+        if code == 0:
+            log(f"  -> {remote} 推送成功")
+        else:
+            log(f"  -> {remote} 推送失败: {err[:200]}")
+    return True
+
+
+def main_loop():
+    log(f"auto_sync 启动: 监控 {PROJECT_DIR}")
+    log(f"  阈值: files >= {MIN_FILES} 或 lines >= {MIN_LINES}, debounce {DEBOUNCE_SECONDS}s")
+
+    last_change_time = None
+    last_summary = (0, 0)
+
+    try:
+        while True:
+            fc, ld, has = get_pending_changes()
+            if has:
+                if (fc, ld) != last_summary:
+                    log(f"检测到变动: {fc} 文件, {ld} 行 (待 debounce)")
+                    last_summary = (fc, ld)
+                last_change_time = time.time()
+            else:
+                # 无变动
+                if last_change_time and (time.time() - last_change_time) > DEBOUNCE_SECONDS:
+                    if is_significant(*last_summary):
+                        log(f"debounce 已过({DEBOUNCE_SECONDS}s),提交 {last_summary[0]} 文件 / {last_summary[1]} 行")
+                        commit_and_push()
+                    else:
+                        log(f"变动未达阈值,跳过: {last_summary}")
+                    last_change_time = None
+                    last_summary = (0, 0)
+            time.sleep(CHECK_INTERVAL)
+    except KeyboardInterrupt:
+        log("用户中断,退出")
+        sys.exit(0)
+
+
+if __name__ == "__main__":
+    main_loop()
