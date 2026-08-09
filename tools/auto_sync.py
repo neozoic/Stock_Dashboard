@@ -131,4 +131,15 @@ def main_loop():
 
 
 if __name__ == "__main__":
-    main_loop()
+    if "--once" in sys.argv:
+        # 单次模式:立即提交并推送
+        log("单次同步模式(--once)")
+        fc, ld, has = get_pending_changes()
+        if has and is_significant(fc, ld):
+            commit_and_push()
+        elif has:
+            log(f"变动未达阈值(已配置: files>={MIN_FILES} lines>={MIN_LINES}): {fc} 文件 / {ld} 行,跳过")
+        else:
+            log("无变动")
+    else:
+        main_loop()
