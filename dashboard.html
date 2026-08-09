@@ -1,0 +1,1175 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<title>A 股资金流实时看板</title>
+<script src="./echarts.min.js"></script>
+<script src="./mock_data.js"></script>
+<style>
+  * { box-sizing: border-box; }
+  html, body { overflow-x: hidden; }
+  body {
+    margin: 0; padding: 10px;
+    font-family: -apple-system, "PingFang SC", "Microsoft YaHei", sans-serif;
+    background: #0d1117; color: #e6edf3;
+  }
+  .header {
+    display: flex; justify-content: space-between; align-items: center;
+    padding: 10px 14px; background: #161b22; border-radius: 8px; margin-bottom: 10px;
+    border: 1px solid #30363d;
+  }
+  .header h1 { font-size: 17px; margin: 0; color: #58a6ff; }
+  .status { display: flex; gap: 14px; font-size: 12px; color: #8b949e; align-items: center; flex-wrap: wrap; }
+  .status .dot {
+    display: inline-block; width: 9px; height: 9px; border-radius: 50%;
+    background: #f85149; margin-right: 4px; vertical-align: middle;
+  }
+  .status .dot.live { background: #3fb950; box-shadow: 0 0 6px #3fb950; }
+  .status .clock-group { display: inline-flex; flex-direction: column; gap: 1px; line-height: 1.15; }
+  .status .clock-group .clock-time { font-size: 12px; color: #c9d1d9; }
+  .status .clock-group .clock-countdown { font-size: 10px; color: #8b949e; font-variant-numeric: tabular-nums; }
+  .status .clock-group.is-open .clock-countdown { color: #3fb950; }
+  .status .clock-state { font-size: 10px; color: #8b949e; display: inline-flex; align-items: center; gap: 4px; }
+  .status .clock-state .dot {
+    display: inline-block; width: 8px; height: 8px; border-radius: 50%;
+    background: #8b949e;
+  }
+  .status .clock-group.is-open .clock-state .dot { background: #3fb950; box-shadow: 0 0 6px #3fb950; }
+  .status .clock-group.is-open .clock-state .state-text { color: #3fb950; }
+  .err {
+    background: #4c1d1d; color: #ffa198; padding: 6px 10px; border-radius: 4px;
+    font-size: 12px; margin-bottom: 8px; display: none;
+  }
+  .err.show { display: block; }
+  .grid {
+    display: grid; grid-template-columns: 1fr; gap: 10px;
+  }
+  .card {
+    background: #161b22; border: 1px solid #30363d; border-radius: 8px;
+    padding: 12px 14px; overflow: hidden;
+  }
+  .card h2 {
+    font-size: 15px; margin: 0 0 8px 0; color: #e6edf3;
+    display: flex; justify-content: space-between; align-items: center;
+  }
+  .card h2 .meta { font-size: 11px; color: #8b949e; font-weight: normal; }
+  .card.full { grid-column: 1 / -1; }
+  .card.chart { height: 320px; display: flex; flex-direction: column; }
+  .card.chart > div { flex: 1; min-height: 0; }
+  .card.market { height: 240px; }
+
+  /* A 股配色:红涨绿跌 */
+  .pos { color: #ff4d4f; font-weight: 600; }
+  .neg { color: #2ea043; font-weight: 600; }
+  .neutral { color: #8b949e; }
+  table.dash {
+    width: 100%; border-collapse: collapse; font-size: 13px;
+  }
+  table.dash thead th {
+    text-align: left; padding: 6px 6px;
+    font-size: 11px; font-weight: normal; color: #8b949e;
+    border-bottom: 1px solid #30363d; position: sticky; top: 0;
+    background: #161b22;
+  }
+  table.dash tbody td {
+    padding: 6px 6px; border-bottom: 1px solid #21262d;
+  }
+  table.dash tbody tr:last-child td { border-bottom: 0; }
+  table.dash .rank { color: #8b949e; width: 30px; }
+  table.dash .num { text-align: right; font-variant-numeric: tabular-nums; }
+  table.dash td.net { font-size: 14px; font-weight: 700; }
+  table.dash.dual td, table.dash.dual th {
+    padding: 6px 8px;
+  }
+  table.dash.dual td.net {
+    font-size: 14px;
+    font-weight: 700;
+  }
+  table.dash.dual {
+    table-layout: fixed;
+  }
+  table.dash.dual thead th.left {
+    background: linear-gradient(to bottom, #2a1818 0%, #161b22 100%);
+    color: #ff7b72;
+    border-right: 2px solid #30363d;
+  }
+  table.dash.dual thead th.right {
+    background: linear-gradient(to bottom, #142a1a 0%, #161b22 100%);
+    color: #7ee787;
+    border-left: 2px solid #30363d;
+  }
+  table.dash.dual td.left {
+    border-right: 1px solid #30363d;
+  }
+  table.dash.dual td.right {
+    border-left: 1px solid #30363d;
+  }
+  table.dash.dual .subhead th {
+    text-align: center !important;
+    font-size: 12px;
+    font-weight: 600;
+    padding: 4px 6px;
+    color: #e6edf3;
+    background: #0d1117;
+  }
+  table.dash.dual .subhead th.left { color: #ff4d4f; }
+  table.dash.dual .subhead th.right { color: #2ea043; }
+</style>
+</head>
+<body>
+<div class="header">
+  <h1>A 股资金流实时看板</h1>
+  <div class="status">
+    <span class="clock-group" title="北京时间 (UTC+8)">
+      <span class="clock-state" id="cn-state"><span class="dot"></span><span class="state-text">CN 检测中</span></span>
+      <span class="clock-time">CN <span id="bj">--:--:--</span></span>
+      <span class="clock-countdown" id="cn-open">距开盘 --</span>
+    </span>
+    <span class="clock-group" title="纽约时间 (美东, 自动处理夏令时)">
+      <span class="clock-state" id="us-state"><span class="dot"></span><span class="state-text">US 检测中</span></span>
+      <span class="clock-time">US <span id="ny">--:--:--</span></span>
+      <span class="clock-countdown" id="us-open">距开盘 --</span>
+    </span>
+    <span>下次: <span id="next">10s</span></span>
+  </div>
+</div>
+<div class="err" id="err"></div>
+
+<div class="grid">
+  <div class="card full chart" style="height:480px;">
+    <h2>近 6 个交易日个股资金净流入 vs 流出 TOP 累计 <span class="meta" id="daily-top-meta">需累积约 6 个交易日数据;首次启动早期数据可能不足</span></h2>
+    <div id="daily-top-chart" style="width:100%;height:220px;"></div>
+    <div style="display:grid;grid-template-columns:1fr 1fr;gap:14px;margin-top:14px;">
+      <div class="scroll" style="max-height:240px;overflow-y:auto;">
+        <h3 style="font-size:12px;color:#ff7b72;margin:0 0 6px 0;" id="daily-inflow-title">当日 TOP 流入 (前 10)</h3>
+        <table id="daily_inflow" class="dash dual"></table>
+      </div>
+      <div class="scroll" style="max-height:240px;overflow-y:auto;">
+        <h3 style="font-size:12px;color:#7ee787;margin:0 0 6px 0;" id="daily-outflow-title">当日 TOP 流出 (前 10)</h3>
+        <table id="daily_outflow" class="dash dual"></table>
+      </div>
+    </div>
+  </div>
+
+  <div class="card">
+    <h2>个股资金 TOP 流入 vs 流出 <span class="meta" id="stock-top-meta">左侧 0 条 vs 右侧 0 条</span></h2>
+    <div class="scroll" style="max-height:380px;overflow-y:auto;">
+      <table id="stock_dual" class="dash dual"></table>
+    </div>
+  </div>
+
+  <div class="card">
+    <h2>行业资金 TOP 流入 vs 流出</h2>
+    <div class="scroll" style="max-height:380px;overflow-y:auto;">
+      <table id="ind_dual" class="dash dual"></table>
+    </div>
+  </div>
+
+  <div class="card">
+    <h2>概念板块 TOP 流入 vs 流出</h2>
+    <div class="scroll" style="max-height:380px;overflow-y:auto;">
+      <table id="con_dual" class="dash dual"></table>
+    </div>
+  </div>
+
+  <div class="card full chart">
+    <h2>个股净流入 TOP 趋势 <span class="meta">每 30s 一个点</span></h2>
+    <div id="trend-stock" style="width:100%;height:280px;"></div>
+  </div>
+
+  <div class="card full chart">
+    <h2>行业净流入 TOP 趋势</h2>
+    <div id="trend-industry" style="width:100%;height:280px;"></div>
+  </div>
+
+  <div class="card full chart">
+    <h2>概念净流入 TOP 趋势</h2>
+    <div id="trend-concept" style="width:100%;height:280px;"></div>
+  </div>
+
+  <div class="card full market chart">
+    <h2>大盘资金净流入趋势 <span class="meta" id="market-meta">-</span></h2>
+    <div id="trend-market" style="width:100%;height:200px;"></div>
+  </div>
+</div>
+
+<script>
+const charts = {
+  stock: echarts.init(document.getElementById("trend-stock")),
+  industry: echarts.init(document.getElementById("trend-industry")),
+  concept: echarts.init(document.getElementById("trend-concept")),
+  market: echarts.init(document.getElementById("trend-market")),
+};
+
+const _setChartOption = (chart, opt) => {
+  if (!chart) return;
+  if (chart.__built) {
+    chart.setOption(opt, false);
+  } else {
+    chart.setOption(opt, true);
+    chart.__built = true;
+  }
+};
+
+const COLORS = [
+  "#ff4d4f", "#58a6ff", "#d29922", "#a371f7", "#2ea043",
+  "#56d4dd", "#ffa657", "#f778ba", "#7ee787", "#ff7b72",
+];
+
+const COLOR_UP = "#ff4d4f";
+const COLOR_DOWN = "#2ea043";
+
+function fmt(v) {
+  if (v === null || v === undefined || v === "") return "-";
+  return String(v);
+}
+
+function toNumber(v) {
+  if (v === null || v === undefined || v === "") return 0;
+  if (typeof v === "number") return v;
+  let s = String(v).trim().replace(/,/g, "");
+  if (s === "" || s === "-") return 0;
+  let mult = 1;
+  if (s.endsWith("亿")) { s = s.slice(0, -1); mult = 1; }
+  else if (s.endsWith("万")) { s = s.slice(0, -1); mult = 0.0001; }
+  else if (s.endsWith("%")) { s = s.slice(0, -1); mult = 1; }
+  const n = parseFloat(s);
+  return isNaN(n) ? 0 : n * mult;
+}
+
+function cls(v) {
+  const n = toNumber(v);
+  if (n > 0) return "pos";
+  if (n < 0) return "neg";
+  return "neutral";
+}
+
+function renderDualStockTable(tbody, topRows, botRows) {
+  if (!tbody) return;
+  const hasInflow = (topRows || []).some(r => r && r["流入资金"] !== undefined);
+  const hasOutflow = (topRows || []).some(r => r && r["流出资金"] !== undefined);
+  const leftCols = hasInflow ? 4 : 3;
+  const rightCols = hasOutflow ? 4 : 3;
+  const totalCols = leftCols + rightCols;
+
+  let html = '<thead>';
+  html += `<tr class="subhead"><th colspan="${leftCols}" class="left">净流入 TOP ${topRows ? topRows.length : 0}</th>`
+        + `<th colspan="${rightCols}" class="right">净流出 TOP ${botRows ? botRows.length : 0}</th></tr>`;
+  html += '<tr>';
+  html += '<th class="left" style="text-align:left">名称</th>';
+  html += '<th class="left num" style="width:64px">涨幅%</th>';
+  if (hasInflow) html += '<th class="left num" style="width:80px">流入</th>';
+  html += '<th class="left num" style="width:84px">净额</th>';
+  html += '<th class="right" style="text-align:left">名称</th>';
+  html += '<th class="right num" style="width:64px">涨幅%</th>';
+  if (hasOutflow) html += '<th class="right num" style="width:80px">流出</th>';
+  html += '<th class="right num" style="width:90px">净额</th>';
+  html += '</tr></thead><tbody>';
+
+  const maxRows = Math.max((topRows || []).length, (botRows || []).length);
+  if (maxRows === 0) {
+    html += `<tr><td colspan="${totalCols}" style="text-align:center;color:#8b949e;padding:24px">无数据</td></tr>`;
+    tbody.innerHTML = html + '</tbody>';
+    return;
+  }
+
+  for (let i = 0; i < maxRows; i++) {
+    const L = (topRows || [])[i];
+    const R = (botRows || [])[i];
+    html += '<tr>';
+    if (L) {
+      const code = fmt(L["股票代码"]);
+      const name = fmt(L["股票简称"]);
+      const nameCell = code ? `${name}<br><span style="color:#8b949e;font-size:11px">${code}</span>` : name;
+      html += `<td class="left" style="text-align:left">${nameCell}</td>`;
+      html += `<td class="num left ${cls(L["涨跌幅"])}">${fmt(L["涨跌幅"])}</td>`;
+      if (hasInflow) html += `<td class="num left ${cls(L["流入资金"])}">${fmt(L["流入资金"])}</td>`;
+      html += `<td class="num net left ${cls(L["净额"])}">${fmt(L["净额"])}</td>`;
+    } else {
+      html += `<td class="left"></td><td class="left"></td>` + (hasInflow ? `<td class="left"></td>` : '') + `<td class="left"></td>`;
+    }
+    if (R) {
+      const code = fmt(R["股票代码"]);
+      const name = fmt(R["股票简称"]);
+      const nameCell = code ? `${name}<br><span style="color:#8b949e;font-size:11px">${code}</span>` : name;
+      html += `<td class="right" style="text-align:left">${nameCell}</td>`;
+      html += `<td class="num right ${cls(R["涨跌幅"])}">${fmt(R["涨跌幅"])}</td>`;
+      if (hasOutflow) html += `<td class="num right ${cls(R["流出资金"])}">${fmt(R["流出资金"])}</td>`;
+      html += `<td class="num net right ${cls(R["净额"])}">${fmt(R["净额"])}</td>`;
+    } else {
+      html += `<td class="right"></td><td class="right"></td>` + (hasOutflow ? `<td class="right"></td>` : '') + `<td class="right"></td>`;
+    }
+    html += '</tr>';
+  }
+  html += '</tbody>';
+  tbody.innerHTML = html;
+}
+
+function renderDualIndustryTable(tbody, topRows, botRows, kind) {
+  if (!tbody) return;
+  const maxRows = Math.max((topRows || []).length, (botRows || []).length);
+  const totalCols = 6;
+  const labelKey = kind;
+  const titleKey = kind === "概念" ? "行业" : "行业";
+  let html = '<thead>';
+  html += `<tr class="subhead"><th colspan="3" class="left">${labelKey}净流入 TOP ${topRows ? topRows.length : 0}</th>`
+        + `<th colspan="3" class="right">${labelKey}净流出 TOP ${botRows ? botRows.length : 0}</th></tr>`;
+  html += '<tr>';
+  html += `<th class="left" style="text-align:left">${labelKey}</th>`;
+  html += '<th class="left num" style="width:64px">涨幅%</th>';
+  html += '<th class="left num" style="width:84px">净额</th>';
+  html += `<th class="right" style="text-align:left">${labelKey}</th>`;
+  html += '<th class="right num" style="width:64px">涨幅%</th>';
+  html += '<th class="right num" style="width:90px">净额</th>';
+  html += '</tr></thead><tbody>';
+
+  if (maxRows === 0) {
+    html += `<tr><td colspan="${totalCols}" style="text-align:center;color:#8b949e;padding:24px">无数据</td></tr>`;
+    tbody.innerHTML = html + '</tbody>';
+    return;
+  }
+
+  for (let i = 0; i < maxRows; i++) {
+    const L = (topRows || [])[i];
+    const R = (botRows || [])[i];
+    html += '<tr>';
+    if (L) {
+      html += `<td class="left" style="text-align:left">${fmt(L[titleKey])}</td>`;
+      html += `<td class="num left ${cls(L["行业-涨跌幅"])}">${fmt(L["行业-涨跌幅"])}</td>`;
+      html += `<td class="num net left ${cls(L["净额"])}">${fmt(L["净额"])}</td>`;
+    } else {
+      html += `<td class="left"></td><td class="left"></td><td class="left"></td>`;
+    }
+    if (R) {
+      html += `<td class="right" style="text-align:left">${fmt(R[titleKey])}</td>`;
+      html += `<td class="num right ${cls(R["行业-涨跌幅"])}">${fmt(R["行业-涨跌幅"])}</td>`;
+      html += `<td class="num net right ${cls(R["净额"])}">${fmt(R["净额"])}</td>`;
+    } else {
+      html += `<td class="right"></td><td class="right"></td><td class="right"></td>`;
+    }
+    html += '</tr>';
+  }
+  html += '</tbody>';
+  tbody.innerHTML = html;
+}
+
+function hhmmssToMin(hhmmss) {
+  const parts = hhmmss.split(":").map(Number);
+  const hh = parts[0] || 0;
+  const mm = parts[1] || 0;
+  const ss = parts[2] || 0;
+  return hh * 60 + mm + ss / 60 - (9 * 60 + 30);
+}
+
+function toTradingMin(hhmmss) {
+  const m = hhmmssToMin(hhmmss);
+  if (m <= 120) return m;
+  if (m <= 210) return 120;
+  return m - 90;
+}
+
+const TRADING_AXIS_BREAKS = [
+  { min: 0,   label: "09:30" },
+  { min: 30,  label: "10:00" },
+  { min: 60,  label: "10:30" },
+  { min: 90,  label: "11:00" },
+  { min: 120, label: "11:30" },
+  { min: 150, label: "13:00" },
+  { min: 180, label: "13:30" },
+  { min: 210, label: "14:00" },
+  { min: 240, label: "14:30" },
+  { min: 270, label: "15:00" },
+];
+
+function buildSeries(data, nameMap, timestamps) {
+  const orderedKeys = Object.keys(nameMap).length > 0
+    ? Object.keys(nameMap).filter(k => data[k] !== undefined)
+    : Object.keys(data);
+  const MARK_LINE = {
+    silent: true,
+    symbol: "none",
+    lineStyle: { color: "#8b949e", type: "dashed", width: 1 },
+    data: [
+      { xAxis: 120, label: { show: true, position: "end", color: "#8b949e", fontSize: 9, formatter: "午休" } },
+    ],
+  };
+  const result = orderedKeys.map((key, i) => {
+    const name = nameMap[key] || key;
+    const values = data[key] || [];
+    const points = timestamps.map((t, idx) => {
+      const v = values[idx];
+      return {
+        name: t,
+        value: [toTradingMin(t), v],
+        itemStyle: { color: v > 0 ? COLOR_UP : v < 0 ? COLOR_DOWN : "#8b949e" },
+      };
+    });
+    return {
+      name,
+      type: "line",
+      smooth: true,
+      showSymbol: false,
+      lineStyle: { width: 2 },
+      itemStyle: { color: COLORS[i % COLORS.length] },
+      data: points,
+      connectNulls: false,
+      ...(i === 0 ? { markLine: MARK_LINE } : {}),
+    };
+  });
+  return result;
+}
+
+// =================== 折线图光标跟踪与 tooltip 智能定位 ===================
+// 5 张折线图统一使用 CHART_CURSOR_OPT,确保:
+//   1. axisPointer:cross 实线 + label 始终可见(光标移动时实时跟踪)
+//   2. tooltip.confine: true — tooltip 限制在图表区域内(避免超出屏幕)
+//   3. tooltip.position — 智能选择光标右/左侧,避免超出图表
+//   4. tooltip.backgroundColor/borderColor — 与看板深色主题一致
+// 通用 axis tooltip formatter:限制最多显示 8 条 series,
+// 避免 40+ 条行业/概念全部列出导致 tooltip 超高、超出屏幕。
+const TREND_TOOLTIP_FORMATTER = function (params) {
+  if (!Array.isArray(params) || params.length === 0) return "";
+  const MAX = 8;
+  const rows = params.slice(0, MAX);
+  // 取 Y 值:axis 触发的 params 里 value 是 [x, y] 数组
+  const getY = function (p) {
+    const v = p.value;
+    if (v == null) return null;
+    return Array.isArray(v) ? v[1] : v;
+  };
+  const fmtVal = function (v) {
+    if (v == null || v === "") return "-";
+    const n = Number(v);
+    return isNaN(n) ? String(v) : n.toFixed(2) + " 亿";
+  };
+  let html = "";
+  for (let i = 0; i < rows.length; i++) {
+    const p = rows[i];
+    if (p && p.marker !== undefined && p.seriesName !== undefined) {
+      const y = getY(p);
+      html += p.marker + " " + p.seriesName + ": " + fmtVal(y) + "<br/>";
+    }
+  }
+  if (params.length > MAX) {
+    html += '<span style="color:#8b949e">... 等 ' + params.length + " 条</span>";
+  }
+  return html;
+};
+
+const CHART_CURSOR_OPT = {
+  tooltip: {
+    trigger: "axis",
+    confine: true,                  // 限制在图表区域内,绝不超出屏幕
+    backgroundColor: "rgba(22,27,34,0.95)",
+    borderColor: "#30363d",
+    borderWidth: 1,
+    textStyle: { color: "#e6edf3", fontSize: 12 },
+    extraCssText: "max-width:380px;white-space:normal;word-break:break-all;",
+    // 智能位置:鼠标右侧 > 鼠标下方 > 鼠标上方 > 鼠标左侧
+    // 注意:ECharts 在 dispatchAction / 触发的 tooltip 中, pos 是【页面坐标】(pageX, pageY),
+    // 但返回值必须是【容器内坐标】(相对于 chart 容器左上角)。
+    // 同时配合 confine: true,即使返回值有偏差也只会在容器内裁剪。
+    position: function (pos, params, dom, rect, size) {
+      if (!dom || !size) return pos;
+      const containerRect = dom.getBoundingClientRect();
+      const [pageX, pageY] = pos;
+      // 页面坐标 → 容器内坐标
+      const x = pageX - containerRect.left;
+      const y = pageY - containerRect.top;
+      const tw = size.contentSize[0];
+      const th = size.contentSize[1];
+      const vw = size.viewSize[0];
+      const vh = size.viewSize[1];
+      const margin = 14;
+      let tx = x + 16;
+      let ty = y - th / 2;
+      if (tx + tw + margin > vw) tx = x - tw - 16;
+      if (tx < margin) tx = Math.max(margin, Math.min(x + 16, vw - tw - margin));
+      if (ty < margin) ty = margin;
+      if (ty + th + margin > vh) ty = vh - th - margin;
+      return [tx, ty];
+    },
+  },
+  axisPointer: {
+    type: "cross",
+    snap: false,        // 不强制吸附到最近数据点,光标自由移动
+    triggerOn: "mousemove|click",  // 同时响应移动与点击(便于看固定时间)
+    label: {
+      show: true,        // 始终显示 X/Y 当前值
+      backgroundColor: "#444",
+      color: "#fff",
+      fontSize: 11,
+      padding: [3, 5],
+    },
+    lineStyle: {
+      color: "#8b949e",
+      width: 1.2,
+      type: "solid",     // 实线(虚线在小屏看不清)
+    },
+    crossStyle: {
+      color: "#8b949e",
+      width: 1.2,
+      type: "solid",
+    },
+    // hover 时高亮当前时间点的所有 series 数据点
+    triggerEmphasis: true,
+  },
+};
+
+function renderTrendSeries(chart, timestamps, dataDict, nameMap) {
+  if (!timestamps || timestamps.length === 0) {
+    _setChartOption(chart, {
+      title: { text: "暂无趋势数据 (等待第二次刷新)", left: "center", top: "middle",
+        textStyle: { color: "#8b949e", fontSize: 13 } },
+    });
+    return;
+  }
+  const series = buildSeries(dataDict, nameMap, timestamps);
+  _setChartOption(chart, {
+    backgroundColor: "transparent",
+    textStyle: { color: "#e6edf3", fontSize: 12 },
+    ...CHART_CURSOR_OPT,
+    tooltip: {
+      ...CHART_CURSOR_OPT.tooltip,
+      formatter: TREND_TOOLTIP_FORMATTER,
+    },
+    axisPointer: CHART_CURSOR_OPT.axisPointer,
+    legend: { textStyle: { color: "#e6edf3", fontSize: 11 }, top: 0, type: "scroll" },
+    grid: { left: 56, right: 24, top: 36, bottom: 56 },
+    xAxis: {
+      type: "value",
+      min: 0,
+      max: 270,
+      interval: 30,
+      axisLabel: {
+        color: "#8b949e", fontSize: 10,
+        formatter: (val) => {
+          const b = TRADING_AXIS_BREAKS.find(x => x.min === val);
+          return b ? b.label : "";
+        },
+      },
+      splitLine: { lineStyle: { color: "#21262d" } },
+    },
+    yAxis: {
+      type: "value", name: "净额(亿)", nameTextStyle: { color: "#8b949e", fontSize: 10 },
+      axisLabel: { color: "#8b949e", fontSize: 10 },
+      splitLine: { lineStyle: { color: "#21262d" } },
+    },
+    series,
+  });
+}
+
+function renderMarketTrend(chart, timestamps, market) {
+  if (!timestamps || timestamps.length === 0) {
+    _setChartOption(chart, {
+      title: { text: "暂无大盘数据", left: "center", top: "middle",
+        textStyle: { color: "#8b949e", fontSize: 13 } },
+    });
+    return;
+  }
+  const cur = market.length > 0 ? market[market.length - 1] : 0;
+  const min = Math.min(...market);
+  const max = Math.max(...market);
+  const lineColor = cur >= 0 ? COLOR_UP : COLOR_DOWN;
+  const areaTopColor = cur >= 0 ? "rgba(255, 77, 79, 0.4)" : "rgba(46, 160, 67, 0.4)";
+  const points = timestamps.map((t, idx) => [toTradingMin(t), market[idx]]);
+  _setChartOption(chart, {
+    backgroundColor: "transparent",
+    textStyle: { color: "#e6edf3", fontSize: 12 },
+    ...CHART_CURSOR_OPT,
+    tooltip: {
+      ...CHART_CURSOR_OPT.tooltip,
+      formatter: TREND_TOOLTIP_FORMATTER,
+    },
+    axisPointer: CHART_CURSOR_OPT.axisPointer,
+    grid: { left: 56, right: 24, top: 20, bottom: 56 },
+    xAxis: {
+      type: "value",
+      min: 0,
+      max: 270,
+      interval: 30,
+      axisLabel: {
+        color: "#8b949e", fontSize: 10,
+        formatter: (val) => {
+          const b = TRADING_AXIS_BREAKS.find(x => x.min === val);
+          return b ? b.label : "";
+        },
+      },
+      splitLine: { lineStyle: { color: "#21262d" } },
+    },
+    yAxis: {
+      type: "value", name: "净流入(亿)", nameTextStyle: { color: "#8b949e", fontSize: 10 },
+      axisLabel: { color: "#8b949e", fontSize: 10 },
+      splitLine: { lineStyle: { color: "#21262d" } },
+    },
+    series: [{
+      name: "大盘净流入",
+      type: "line",
+      smooth: true,
+      showSymbol: false,
+      connectNulls: false,
+      areaStyle: {
+        color: {
+          type: "linear", x: 0, y: 0, x2: 0, y2: 1,
+          colorStops: [
+            { offset: 0, color: areaTopColor },
+            { offset: 1, color: "rgba(0, 0, 0, 0)" },
+          ],
+        },
+      },
+      lineStyle: { color: lineColor, width: 2 },
+      itemStyle: { color: lineColor },
+      data: points,
+      markLine: {
+        silent: true,
+        symbol: "none",
+        lineStyle: { color: "#8b949e", type: "dashed", width: 1 },
+        data: [
+          { xAxis: 120, label: { show: true, position: "end", color: "#8b949e", fontSize: 9, formatter: "午休" } },
+        ],
+      },
+    }],
+  });
+  const sign = cur >= 0 ? "+" : "";
+  const meta = document.getElementById("market-meta");
+  if (meta) {
+    meta.innerHTML = `当前: <b class="${cur >= 0 ? "pos" : "neg"}">${sign}${cur.toFixed(2)} 亿</b> · 区间 ${min.toFixed(2)} ~ ${max.toFixed(2)}`;
+  }
+}
+
+let countdown = 10;
+
+async function fetchData() {
+  try {
+    const r = await fetch("/api/data", { cache: "no-store" });
+    if (!r.ok) throw new Error("HTTP " + r.status);
+    const d = await r.json();
+
+    let source = "live";
+    let dataDate = (d.timestamp || "").slice(0, 10);
+    if (!d.stock_top || d.stock_top.length === 0) {
+      try {
+        const lr = await fetch("/api/data/latest", { cache: "no-store" });
+        if (lr.ok) {
+          const ld = await lr.json();
+          if (ld.stock_top && ld.stock_top.length > 0) {
+            d.stock_top = ld.stock_top;
+            d.stock_bottom = ld.stock_bottom || [];
+            d.industry_top = ld.industry_top || [];
+            d.industry_bottom = ld.industry_bottom || [];
+            d.concept_top = ld.concept_top || [];
+            d.concept_bottom = ld.concept_bottom || [];
+            source = "daily_snapshot";
+            dataDate = ld.date || dataDate;
+          }
+        }
+      } catch (_) { }
+    }
+
+    updateTradingStates();
+
+    const errEl = document.getElementById("err");
+    const isFallback = source === "daily_snapshot";
+    if (d.error) { errEl.textContent = "错误: " + d.error; errEl.classList.add("show"); }
+    else if (isFallback) {
+      errEl.textContent = `当前为非交易时段,显示最近 1 日数据(${dataDate || "?"})`;
+      errEl.classList.add("show");
+    } else {
+      errEl.classList.remove("show");
+    }
+
+    renderDualStockTable(document.getElementById("stock_dual"), d.stock_top, d.stock_bottom);
+    renderDualIndustryTable(document.getElementById("ind_dual"), d.industry_top, d.industry_bottom, "行业");
+    renderDualIndustryTable(document.getElementById("con_dual"), d.concept_top, d.concept_bottom, "概念");
+
+    const setMeta = (id, rows) => {
+      const el = document.getElementById(id);
+      if (el && rows) el.textContent = `左侧 ${d.stock_top.length} 条 vs 右侧 ${d.stock_bottom.length} 条`;
+    };
+    setMeta("stock-top-meta", d.stock_top);
+
+    fetchPeriodData();
+  } catch (e) {
+    document.getElementById("err").textContent = "数据获取失败: " + e.message;
+    document.getElementById("err").classList.add("show");
+  }
+}
+
+const dailyTopChart = echarts.init(document.getElementById("daily-top-chart"));
+
+function renderDailyTopChart(d) {
+  const daily = (d && d.daily) || [];
+  const requested = d.requested || 6;
+  const have = daily.length;
+
+  const xLabels = [];
+  for (let i = 0; i < requested; i++) {
+    const offset = requested - 1 - i;
+    xLabels.push(offset === 0 ? "T" : `T-${offset}`);
+  }
+
+  const seriesMap = new Map();
+  function addRow(code, name, value, dayIdx, isInflow) {
+    if (!code) return;
+    if (!seriesMap.has(code)) {
+      seriesMap.set(code, {
+        code,
+        name: `${truncateName(name, 4)} (${code})`,
+        data: new Array(requested).fill(null),
+        isInflow,
+        lastNonNullIdx: -1,
+      });
+    }
+    const s = seriesMap.get(code);
+    s.data[dayIdx] = value;
+    if (value !== null && value !== undefined) s.lastNonNullIdx = dayIdx;
+  }
+
+  for (let i = 0; i < have; i++) {
+    const day = daily[i];
+    for (const r of (day.stock_top || [])) {
+      const code = r["股票代码"];
+      const v = parseAmountToYi(r["净额"]);
+      if (v === null) continue;
+      addRow(code, r["股票简称"], v, i, true);
+    }
+    for (const r of (day.stock_bottom || [])) {
+      const code = r["股票代码"];
+      const v = parseAmountToYi(r["净额"]);
+      if (v === null) continue;
+      addRow(code, r["股票简称"], v, i, false);
+    }
+  }
+
+  function nonNullCount(arr) {
+    let n = 0;
+    for (const x of arr) if (x !== null && x !== undefined) n++;
+    return n;
+  }
+  const sorted = Array.from(seriesMap.values()).sort((a, b) =>
+    nonNullCount(b.data) - nonNullCount(a.data)
+  ).slice(0, 30);
+
+  const PALETTE_IN = ["#ff4d4f", "#ff7b72", "#ff9472", "#ffb380", "#ffc1a3", "#ffa657", "#d29922", "#a371f7"];
+  const PALETTE_OUT = ["#2ea043", "#7ee787", "#56d4dd", "#3fb950", "#2da44e", "#1a7f37", "#116329", "#0f5132"];
+  const series = sorted.map((s, idx) => {
+    const palette = s.isInflow ? PALETTE_IN : PALETTE_OUT;
+    const color = palette[idx % palette.length];
+    return {
+      name: s.name,
+      type: "line",
+      smooth: false,
+      showSymbol: true,
+      symbolSize: 6,
+      connectNulls: false,
+      lineStyle: { color, width: 1.5 },
+      itemStyle: { color },
+      emphasis: { focus: "series", scale: 1.5 },
+      data: s.data,
+      markPoint: {
+        symbol: "circle",
+        symbolSize: 4,
+        data: (() => {
+          const arr = [];
+          for (let i = 0; i < s.data.length; i++) {
+            if (s.data[i] !== null && s.data[i] !== undefined) {
+              arr.push({ name: s.name, coord: [xLabels[i], s.data[i]], value: s.data[i] });
+            }
+          }
+          return arr;
+        })(),
+        label: { show: false },
+        tooltip: {
+          show: true,
+          formatter: (p) => `${s.name}<br/>${xLabels[p.data.coord[0]]}: ${typeof p.value === "number" ? p.value.toFixed(2) + " 亿" : p.value}`,
+        }
+      },
+    };
+  });
+
+  const tooltipFormatter = (params) => {
+    if (!params || !params.length) return "";
+    const idx = params[0].dataIndex;
+    const day = idx < have ? daily[idx] : null;
+    let html = `<div style="font-size:12px;line-height:1.5;max-width:380px;">`;
+    html += `<b>${xLabels[idx]}${day ? ` (${day.date || ""})` : ""}</b><br/>`;
+    if (day) {
+      const inTop = (day.stock_top || []).slice(0, 5);
+      const outTop = (day.stock_bottom || []).slice(0, 5);
+      html += `<span style="color:#ff7b72">流入 TOP5:</span><br/>`;
+      inTop.forEach((r, k) => {
+        html += `&nbsp;&nbsp;${k + 1}. ${fmt(r["股票简称"])} (${fmt(r["股票代码"])}) <span style="color:${cls(r["净额"]) === "pos" ? "#ff7b72" : "#7ee787"}">${fmt(r["净额"])}</span><br/>`;
+      });
+      html += `<span style="color:#7ee787">流出 TOP5:</span><br/>`;
+      outTop.forEach((r, k) => {
+        html += `&nbsp;&nbsp;${k + 1}. ${fmt(r["股票简称"])} (${fmt(r["股票代码"])}) <span style="color:${cls(r["净额"]) === "pos" ? "#ff7b72" : "#7ee787"}">${fmt(r["净额"])}</span><br/>`;
+      });
+    } else {
+      html += `<br/>尚无数据`;
+    }
+    html += `</div>`;
+    return html;
+  };
+
+  _setChartOption(dailyTopChart, {
+    backgroundColor: "transparent",
+    textStyle: { color: "#e6edf3", fontSize: 12 },
+    tooltip: {
+      ...CHART_CURSOR_OPT.tooltip,
+      formatter: tooltipFormatter,
+    },
+    axisPointer: CHART_CURSOR_OPT.axisPointer,
+    legend: { textStyle: { color: "#c9d1d9", fontSize: 10 }, type: "scroll", orient: "vertical", right: 10, top: "middle",
+      itemWidth: 12, itemHeight: 8, pageIconColor: "#8b949e", pageTextStyle: { color: "#8b949e" } },
+    grid: { left: 56, right: 180, top: 20, bottom: 30 },
+    xAxis: { type: "category", data: xLabels, axisLabel: { color: "#8b949e", fontSize: 11 }, axisLine: { lineStyle: { color: "#30363d" } } },
+    yAxis: { type: "value", name: "亿元", nameTextStyle: { color: "#8b949e", fontSize: 10 },
+      axisLabel: { color: "#8b949e", fontSize: 10 }, splitLine: { lineStyle: { color: "#21262d" } } },
+    series: series,
+  });
+
+  const metaEl = document.getElementById("daily-top-meta");
+  if (metaEl) {
+    if (have === 0) {
+      metaEl.textContent = "尚无数据:等待首日收盘后保存(约 15:30 后)";
+    } else if (have < requested) {
+      metaEl.textContent = `已累积 ${have}/${requested} 个交易日;首次启动约 6 天后填满`;
+    } else {
+      metaEl.textContent = `已累积 ${have} 个交易日 · 共 ${series.length} 只代表股(取出现最多的 30 只)`;
+    }
+  }
+
+  if (have > 0) {
+    const last = daily[have - 1];
+    renderDailyDetailTable("daily_inflow", last.stock_top || [], "流入净额");
+    renderDailyDetailTable("daily_outflow", last.stock_bottom || [], "流出净额");
+    const lastDate = last.date || "";
+    const inTitle = document.getElementById("daily-inflow-title");
+    const outTitle = document.getElementById("daily-outflow-title");
+    if (inTitle) inTitle.textContent = `${lastDate} 当日 TOP 流入(前 10)`;
+    if (outTitle) outTitle.textContent = `${lastDate} 当日 TOP 流出(前 10)`;
+  } else {
+    renderDailyDetailTable("daily_inflow", [], "流入净额");
+    renderDailyDetailTable("daily_outflow", [], "流出净额");
+  }
+}
+
+function parseAmountToYi(v) {
+  if (v === null || v === undefined || v === "") return null;
+  if (typeof v === "number") return v;
+  let s = String(v).trim().replace(/,/g, "");
+  let mult = 1;
+  if (s.endsWith("亿")) { s = s.slice(0, -1); mult = 1; }
+  else if (s.endsWith("万")) { s = s.slice(0, -1); mult = 0.0001; }
+  else if (s.endsWith("%")) { s = s.slice(0, -1); mult = 1; }
+  const n = parseFloat(s);
+  return isNaN(n) ? null : n * mult;
+}
+
+function truncateName(s, max) {
+  if (!s) return "";
+  return s.length > max ? s.slice(0, max) + "..." : s;
+}
+
+function renderDailyDetailTable(id, rows, label) {
+  const tbl = document.getElementById(id);
+  if (!tbl) return;
+  if (!rows || rows.length === 0) {
+    tbl.innerHTML = `<thead><tr><th>#</th><th>代码</th><th>名称</th><th class="num">涨跌幅</th><th class="num">${label}</th></tr></thead>`
+      + `<tbody><tr><td colspan="5" style="text-align:center;color:#8b949e;padding:24px">${label === '流入净额' ? '尚无流入快照' : '尚无流出快照'}</td></tr></tbody>`;
+    return;
+  }
+  let html = `<thead><tr><th>#</th><th>代码</th><th>名称</th><th class="num">涨跌幅</th><th class="num">${label}</th></tr></thead><tbody>`;
+  rows.forEach((r, i) => {
+    html += `<tr>
+      <td class="rank">${i + 1}</td>
+      <td>${fmt(r["股票代码"])}</td>
+      <td>${fmt(r["股票简称"])}</td>
+      <td class="num ${cls(r["涨跌幅"])}">${fmt(r["涨跌幅"])}</td>
+      <td class="num net ${cls(r["净额"])}">${fmt(r["净额"])}</td>
+    </tr>`;
+  });
+  html += "</tbody>";
+  tbl.innerHTML = html;
+}
+
+async function fetchPeriodData() {
+  try {
+    const r = await fetch(`/api/data/daily_top?n=6`, { cache: "no-store" });
+    if (!r.ok) return;
+    const d = await r.json();
+    renderDailyTopChart(d);
+  } catch (e) { }
+}
+
+async function fetchTrend() {
+  try {
+    const r = await fetch("/api/trend", { cache: "no-store" });
+    if (!r.ok) return;
+    const d = await r.json();
+    const cutoff = 24 * 60;
+    const allTs = d.timestamps || [];
+    const indices = [];
+    for (let i = 0; i < allTs.length; i++) {
+      const parts = allTs[i].split(":");
+      const hh = Number(parts[0]) || 0;
+      const mm = Number(parts[1]) || 0;
+      if (hh * 60 + mm <= cutoff) indices.push(i);
+    }
+    const ts = indices.map(i => allTs[i]);
+    const names = d.names || {};
+    const filterArr = arr => indices.map(i => arr[i]);
+    renderTrendSeries(charts.stock, ts, Object.fromEntries(
+      Object.entries(d.stock || {}).map(([k, v]) => [k, filterArr(v)])
+    ), names.stock || {});
+    renderTrendSeries(charts.industry, ts, Object.fromEntries(
+      Object.entries(d.industry || {}).map(([k, v]) => [k, filterArr(v)])
+    ), names.industry || {});
+    renderTrendSeries(charts.concept, ts, Object.fromEntries(
+      Object.entries(d.concept || {}).map(([k, v]) => [k, filterArr(v)])
+    ), names.concept || {});
+    renderMarketTrend(charts.market, ts, filterArr(d.market || []));
+  } catch (e) {}
+}
+
+function updateClocks() {
+  const now = new Date();
+  const bj = now.toLocaleString("zh-CN", {
+    timeZone: "Asia/Shanghai",
+    hour12: false,
+    hour: "2-digit", minute: "2-digit", second: "2-digit",
+  });
+  const ny = now.toLocaleString("en-US", {
+    timeZone: "America/New_York",
+    hour12: false,
+    hour: "2-digit", minute: "2-digit", second: "2-digit",
+  });
+  const bjEl = document.getElementById("bj");
+  const nyEl = document.getElementById("ny");
+  if (bjEl) bjEl.textContent = bj;
+  if (nyEl) nyEl.textContent = ny;
+}
+updateClocks();
+
+function nextOpenCountdown(now, tz, openHour, openMinute, sessions, extra) {
+  extra = extra || {};
+  const pre = extra.pre || [];
+  const after = extra.after || [];
+  const overnight = extra.overnight || [];
+  const workdays = extra.workdays || [1, 2, 3, 4, 5];
+
+  const localFmt = new Intl.DateTimeFormat("en-CA", {
+    timeZone: tz, hour12: false,
+    year: "numeric", month: "2-digit", day: "2-digit",
+    hour: "2-digit", minute: "2-digit", second: "2-digit",
+    weekday: "short",
+  });
+  const parts = localFmt.formatToParts(now).reduce((acc, p) => {
+    if (p.type !== "literal") acc[p.type] = p.value;
+    return acc;
+  }, {});
+  const y = parseInt(parts.year, 10);
+  const mo = parseInt(parts.month, 10) - 1;
+  const d = parseInt(parts.day, 10);
+  const h = parseInt(parts.hour === "24" ? "0" : parts.hour, 10);
+  const mi = parseInt(parts.minute, 10);
+  const s = parseInt(parts.second, 10);
+  const wdMap = { Sun: 0, Mon: 1, Tue: 2, Wed: 3, Thu: 4, Fri: 5, Sat: 6 };
+  const wd = wdMap[parts.weekday];
+  const curMin = h * 60 + mi;
+  const isWorkday = workdays.includes(wd);
+
+  const inSess = (s) => curMin >= s[0] * 60 + s[1] && curMin < s[2] * 60 + s[3];
+
+  if (!isWorkday) {
+    return _calcNextOpen(now, tz, parts, wdMap, workdays, y, mo, d, curMin, s, openHour, openMinute);
+  }
+
+  if (overnight.length > 0) {
+    const o1 = overnight[0];
+    if (curMin >= o1[0] * 60 + o1[1] && curMin < o1[2] * 60 + o1[3]) {
+      const remain = (o1[2] * 60 + o1[3] - curMin) * 60 - s;
+      return { state: "overnight", text: `夜盘 · 剩 ${fmtDuration(remain * 1000)}` };
+    }
+    if (overnight.length > 1) {
+      const o2 = overnight[1];
+      if (curMin >= o2[0] * 60 + o2[1] && curMin < o2[2] * 60 + o2[3]) {
+        const remain = (o2[2] * 60 + o2[3] - curMin) * 60 - s;
+        return { state: "overnight", text: `夜盘 · 剩 ${fmtDuration(remain * 1000)}` };
+      }
+    }
+  }
+
+  if (pre.length > 0 && pre.some(inSess)) {
+    const sess = pre.find(inSess);
+    const remain = (sess[2] * 60 + sess[3] - curMin) * 60 - s;
+    return { state: "pre", text: `盘前 · 剩 ${fmtDuration(remain * 1000)}` };
+  }
+
+  for (const sess of sessions) {
+    if (inSess(sess)) {
+      const remain = (sess[2] * 60 + sess[3] - curMin) * 60 - s;
+      return { state: "open", text: `盘中 · 剩 ${fmtDuration(remain * 1000)}` };
+    }
+  }
+
+  if (after.length > 0 && after.some(inSess)) {
+    const sess = after.find(inSess);
+    const remain = (sess[2] * 60 + sess[3] - curMin) * 60 - s;
+    return { state: "after", text: `盘后 · 剩 ${fmtDuration(remain * 1000)}` };
+  }
+
+  const sortedSessions = [...sessions].sort((a, b) => (a[0] * 60 + a[1]) - (b[0] * 60 + b[1]));
+  for (let i = 0; i < sortedSessions.length - 1; i++) {
+    const endEnd = sortedSessions[i][2] * 60 + sortedSessions[i][3];
+    const nextStart = sortedSessions[i + 1][0] * 60 + sortedSessions[i + 1][1];
+    if (curMin >= endEnd && curMin < nextStart) {
+      const remain = (nextStart - curMin) * 60 - s;
+      return { state: "between", text: `午休 · 距开盘 ${fmtDuration(remain * 1000)}` };
+    }
+  }
+
+  return _calcNextOpen(now, tz, parts, wdMap, workdays, y, mo, d, curMin, s, openHour, openMinute);
+}
+
+function _calcNextOpen(now, tz, parts, wdMap, workdays, y, mo, d, curMin, s, openHour, openMinute) {
+  // 构造固定的 nextUtc：目标工作日在 tz 下的 09:30:00 对应的 UTC 毫秒。
+  // 关键:不把 gSec 加进去,否则 nextUtc 会随 now 的秒数同步偏移,导致 remain 永远不变。
+  const targetFmt = new Intl.DateTimeFormat("en-CA", {
+    timeZone: tz, hour12: false, weekday: "short",
+    year: "numeric", month: "2-digit", day: "2-digit",
+    hour: "2-digit", minute: "2-digit", second: "2-digit",
+  });
+  const localParts = (date) => targetFmt.formatToParts(date).reduce((acc, p) => {
+    if (p.type !== "literal") acc[p.type] = p.value;
+    return acc;
+  }, {});
+
+  for (let n = 1; n <= 8; n++) {
+    const guess = new Date(now.getTime() + n * 24 * 3600 * 1000);
+    const gp = localParts(guess);
+    if (!workdays.includes(wdMap[gp.weekday])) continue;
+    // 构造 guess 在 tz 下的"年-月-日"对应的 00:00:00 UTC 时刻
+    const localDayStartUtc = Date.UTC(
+      parseInt(gp.year), parseInt(gp.month) - 1, parseInt(gp.day),
+      0, 0, 0
+    );
+    // 推算 tz 偏移:guess 在 tz 下显示为某天某时某分某秒,反推 tz 偏移
+    const tzOffset = guess.getTime() - Date.UTC(
+      parseInt(gp.year), parseInt(gp.month) - 1, parseInt(gp.day),
+      parseInt(gp.hour === "24" ? "0" : gp.hour, 10),
+      parseInt(gp.minute, 10),
+      parseInt(gp.second, 10)
+    );
+    // tz 下"目标日 09:30:00"对应的 UTC 时刻
+    const nextUtc = localDayStartUtc + tzOffset + openHour * 3600 * 1000 + openMinute * 60 * 1000;
+    if (nextUtc > now.getTime()) {
+      const remain = nextUtc - now.getTime();
+      return { state: "closed", text: `距开盘 ${fmtDuration(remain)}` };
+    }
+  }
+  return { state: "closed", text: "已收盘" };
+}
+
+function fmtDuration(ms) {
+  if (ms <= 0) return "00:00:00";
+  const total = Math.floor(ms / 1000);
+  const h = Math.floor(total / 3600);
+  const m = Math.floor((total % 3600) / 60);
+  const s = total % 60;
+  return [h, m, s].map(v => String(v).padStart(2, "0")).join(":");
+}
+
+const STATE_LABEL = {
+  closed:    { cn: "CN 休市", us: "US 休市", open: false },
+  pre:       { cn: "CN 盘前", us: "US 盘前", open: false },
+  open:      { cn: "CN 交易中", us: "US 交易中", open: true },
+  after:     { cn: "CN 盘后", us: "US 盘后", open: false },
+  overnight: { cn: "CN 已收盘", us: "US 夜盘", open: false },
+  between:   { cn: "CN 午休", us: "US 午休", open: false },
+};
+
+const CN_CFG = {
+  tz: "Asia/Shanghai", openHour: 9, openMinute: 30,
+  sessions: [[9, 30, 11, 30], [13, 0, 15, 0]],
+  pre: [], after: [], overnight: [],
+  workdays: [1, 2, 3, 4, 5],
+};
+
+const US_CFG = {
+  tz: "America/New_York", openHour: 9, openMinute: 30,
+  sessions: [[9, 30, 16, 0]],
+  pre:       [[4, 0, 9, 30]],
+  after:     [[16, 0, 20, 0]],
+  overnight: [[20, 0, 24, 0], [0, 0, 4, 0]],
+  workdays: [1, 2, 3, 4, 5],
+};
+
+function updateOpenCountdown() {
+  const now = new Date();
+  const cn = nextOpenCountdown(now, CN_CFG.tz, CN_CFG.openHour, CN_CFG.openMinute, CN_CFG.sessions, CN_CFG);
+  const us = nextOpenCountdown(now, US_CFG.tz, US_CFG.openHour, US_CFG.openMinute, US_CFG.sessions, US_CFG);
+
+  const cnEl = document.getElementById("cn-open");
+  const usEl = document.getElementById("us-open");
+  if (cnEl) {
+    cnEl.textContent = cn.text;
+    cnEl.parentElement.classList.toggle("is-open", STATE_LABEL[cn.state]?.open ?? false);
+  }
+  if (usEl) {
+    usEl.textContent = us.text;
+    usEl.parentElement.classList.toggle("is-open", STATE_LABEL[us.state]?.open ?? false);
+  }
+}
+updateOpenCountdown();
+
+function updateTradingStates() {
+  const now = new Date();
+  const cn = nextOpenCountdown(now, CN_CFG.tz, CN_CFG.openHour, CN_CFG.openMinute, CN_CFG.sessions, CN_CFG);
+  const us = nextOpenCountdown(now, US_CFG.tz, US_CFG.openHour, US_CFG.openMinute, US_CFG.sessions, US_CFG);
+
+  const apply = (id, info) => {
+    const wrap = document.getElementById(id);
+    if (!wrap) return;
+    const textEl = wrap.querySelector(".state-text");
+    if (textEl) textEl.textContent = ` ${info.label}`;
+    wrap.parentElement?.classList.toggle("is-open", STATE_LABEL[info.state]?.open ?? false);
+  };
+
+  apply("cn-state", { state: cn.state, label: STATE_LABEL[cn.state]?.cn || "CN 休市" });
+  apply("us-state", { state: us.state, label: STATE_LABEL[us.state]?.us || "US 休市" });
+}
+updateTradingStates();
+
+setInterval(() => {
+  countdown--;
+  if (countdown <= 0) {
+    fetchData();
+    fetchTrend();
+    countdown = 10;
+  }
+  document.getElementById("next").textContent = countdown + "s";
+}, 1000);
+
+setInterval(updateClocks, 1000);
+setInterval(updateOpenCountdown, 1000);
+setInterval(updateTradingStates, 1000);
+
+window.addEventListener("resize", () => {
+  if (window._resizeRaf) return;
+  window._resizeRaf = requestAnimationFrame(() => {
+    window._resizeRaf = null;
+    Object.values(charts).forEach(c => c.resize({silent: true}));
+  });
+});
+
+requestAnimationFrame(() => {
+  Object.values(charts).forEach(c => c.resize({silent: true}));
+});
+
+fetchData();
+fetchTrend();
+</script>
+</body>
+</html>

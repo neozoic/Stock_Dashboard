@@ -1,0 +1,54 @@
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+
+# Logs
+logs/
+*.log
+
+# OS
+.DS_Store
+Thumbs.db
+desktop.ini
+
+# Editor / IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# Test artifacts (Playwright 临时测试)
+_test_*.py
+_check_*.py
+_fix_*.py
+_force_*.py
+_manual_*.py
+_quote_*.py
+_read_*.py
+_recheck*.py
+_regex_*.py
+_scan.py
+_show*.py
+_simple*.py
+_wd.py
+_check.js
+axis_test.png
+cursor_test.png
+cursor_axis.png
+cursor_final.png
+hover_test.png
+mock_screenshot.png
+
+# 临时 wrapper(被新版本取代)
+_*.bat
+
+# 用户级 mock 开关临时文件
+*.local
+
+# 操作系统临时
+*.tmp
+*.bak
+*.swp

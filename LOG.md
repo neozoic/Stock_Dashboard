@@ -1,0 +1,413 @@
+# Stock_Dashboard 项目日志
+
+> 最后更新：2026-08-08
+> 接管来源：`C:\Users\openclaw\` 根目录散落的 Python 脚本 + 通达信数据源
+
+---
+
+## 1. 项目概述
+
+A 股资金流实时看板：
+
+- **数据源**：通达信 TdxQuant（主源 + run_id=槽位管理）+ akshare（同花顺接口兜底）
+- **前端**：单文件 ECharts 5.4.3 单页应用 + 6 张对比表 + 5 张折线图
+- **后端**：`http.server.HTTPServer` + 后台线程拉数 + 环形缓冲历史
+
+### 三层架构
+
+```
+┌─────────────────┐    ┌────────────────────┐    ┌─────────────────────┐
+│ 通达信 TdxQuant  │ →  │  看板后端 (8765)   │ →  │ 浏览器 dashboard.html│
+│ akshare 兜底    │    │  LATEST 缓存         │    │ ECharts 折线图 + 表  │
+└─────────────────┘    └────────────────────┘    └─────────────────────┘
+                              │
+                              ├── daily_snapshot_loop → daily_summaries (10 天环形)
+                              ├── period_background_loop → 3/5/10 日排行 (10 分钟周期)
+                              └── history 时序 (盘中/盘后累积)
+```
+
+---
+
+## 2. 文件清单
+
+| 文件 | 大小 | 作用 |
+|---|---|---|
+| `stock_dashboard.py` | ~50 KB | 主后端：HTTP 路由 + 后台拉数线程 + LATEST 缓存 |
+| `tdx_client.py` | ~26 KB | 通达信 TdxQuant 封装，含 8s 超时（`_call_with_timeout`）|
+| `alert_monitor.py` | ~24 KB | 实时异动监测器（涨停/跌停/大单/异动），GBK emoji 已替换 |
+| `dashboard.html` | ~49 KB | 前端单文件：CSS + JS + 6 张对比表 + 5 张折线图 |
+| `echarts.min.js` | 1 MB | ECharts 5.4.3 本地副本（离线可用，规避 CDN 受限）|
+| `start_dashboard.bat` | <2 KB | UTF-8 + Python 自检 + 设置 TDX_HOME 的启动脚本 |
+| `README.md` | <6 KB | 项目说明（四件套、Python 版本、启动命令）|
+| `.env.example` | <1 KB | 环境变量示例 |
+| `logs/` | — | stdout/stderr 日志目录 |
+| `archive/stock_dashboard_tdx.py` | — | 旧版主程序（已停用，仅作历史参考）|
+
+---
+
+## 3. 关键代码改造（迁移中修复的问题）
+
+| # | 问题 | 文件:行 | 修复 |
+|---|---|---|---|
+| 1 | `C:\new_tdx64` 硬编码 6 处 | `tdx_client.py:41-47` + `alert_monitor.py:318-319` | 改用 `TDX_HOME` / `TDX_EXE_NAME` 环境变量（默认 `C:\new_tdx64`）|
+| 2 | Python 3.12 强校验 | `tdx_client.py:69-72` | 放宽到 3.11–3.13 区间 |
+| 3 | GBK 编码崩溃（✅/❌/🚀/⏰）| `stock_dashboard.py:96, 745, 747` + `alert_monitor.py:79-83, 99, 640` | 替换为 `[OK]` / `[FAIL]` / `[UP]` 等 ASCII 标签 |
+| 4 | 启动时 emoji GBK 报错导致 main() 整体退出 | `stock_dashboard.py` 整体 | `start_dashboard.bat` 强制 `PYTHONIOENCODING=utf-8 PYTHONUTF8=1` |
+| 5 | 代理环境强制清空 | `stock_dashboard.py:27-30` | `if DASHBOARD_KEEP_PROXY != "1"` 包一层，opt-in 退出 |
+| 6 | 端口 8765 硬编码 | `stock_dashboard.py:725` | `DASHBOARD_PORT` 环境变量 |
+| 7 | 绑定 `0.0.0.0` 硬编码 | `stock_dashboard.py:763` | `DASHBOARD_BIND` 环境变量 |
+| 8 | TdxQuant 调用 hang | `tdx_client.py` | `_call_with_timeout()` 包装 5 个阻塞调用（get_stock_list / get_sector_list / get_stock_list_in_sector / get_market_snapshot / get_more_info），`TDX_CALL_TIMEOUT` 默认 8 秒 |
+| 9 | 飞书 webhook 未配置静默 | `alert_monitor.py:33` | 启动期 WARNING 提示 |
+| 10 | `alert_monitor.detect()` `zaf - prev['zaf']` TypeError（TDX 字段类型不稳定）| `alert_monitor.py:208-218` | `float()` 转换 + try/except |
+| 11 | 趋势图 X 轴 `[nan, value]` | `dashboard.html` `hhmmssToMin` | `parts[0]\|\|0, parts[1]\|\|0, parts[2]\|\|0` 兼容 HH:MM 与 HH:MM:SS |
+| 12 | 趋势图容器无高度 | `dashboard.html` | `<div style="width:100%;height:280px">` 显式 |
+| 13 | `/echarts.min.js` 404 | `stock_dashboard.py` `do_GET` | 同目录白名单路由（`.js/.css/.html/.png/.ico`），路径穿越过滤 |
+| 14 | 折线图左上角元素堆叠 | `dashboard.html` `renderDailyTopChart` | 删除 `graphic.elements` 绝对定位，改为 series `markPoint` |
+| 15 | 图例堆在标题区 | `dashboard.html` | legend `orient:"vertical", right:10` 移右侧 + `type:"scroll"` |
+| 16 | 行业/概念流出与流入行数不齐 | demo 数据 | 流出补到 10/15 |
+| 17 | LATEST 被 fetch_once 拉到空 snapshot 时擦掉 | `stock_dashboard.py:991` | `has_data` 守卫：空 snapshot 不覆盖 |
+| 18 | fetch_once 即使空 snapshot 也污染 history | `stock_dashboard.py:956` | history 追加也加 `has_data` 守卫 |
+| 19 | 休市时段前端显示空表 | `dashboard.html` `fetchData()` | 实时数据空 → fetch `/api/data/latest` 取最近一日 |
+| 20 | HTTPServer 单线程阻塞 | `stock_dashboard.py` `main()` | 改 `ThreadingHTTPServer`（socketserver.ThreadingMixIn + daemon_threads=True）|
+| 21 | handler 同步锁 + json.dumps + wfile.write 三合一 | `stock_dashboard.py` `_serve_*` | 锁内只读快照，序列化 + 网络写出走统一 `_send_json_response()`，断连用 try/except |
+| 22 | 后台线程 daemon=true 资源不清理 | `stock_dashboard.py` `main()` | 改 `daemon=False` + `stop_event` + 优雅退出 join |
+| 23 | fetch_once 无总超时 watchdog | `stock_dashboard.py` `background_loop` | 用 `_call_with_timeout(fetch_once, timeout=interval-5)` 包整轮 |
+| 24 | history series key 无上限 | `stock_dashboard.py` push_series | 加 `MAX_SERIES_KEYS=500` + 长期 None series 淘汰 + 用 `del` 裁剪避免 O(N) |
+| 25 | path traversal 返 HTML 404 | `stock_dashboard.py` `do_GET` | 改 `_send_json_response(400, ...)` |
+| 26 | window resize 无节流 | `dashboard.html` | rAF 节流 + `chart.resize({silent:true})` |
+| 27 | handler 响应无 try/except | `stock_dashboard.py` `_send_json_response` | 包 BrokenPipeError / ConnectionResetError / OSError |
+| 28 | `fetch_once` 函数过长、history 与 LATEST 双锁 | | 拆 `_fetch_via_tdx` / `_fetch_via_akshare_fallback` / `_compose_snapshot` / `_commit_snapshot_and_history` 四段，主函数 30 行内 |
+| 29 | 错误拼接重复 `' | xxx: ...'` | `stock_dashboard.py` `_accumulate_error()` | 抽公共函数 + `_classify_error()` 给异常贴 NETWORK/TIMEOUT/AUTH/SCHEMA 标签 |
+| 30 | ECharts 每 10s 全量重建 series | `dashboard.html` `_setChartOption()` |首次 notMerge=true 建模，后续 merge 模式只刷数据 |
+| 31 | history series 与 LATEST 双锁更新可能撕裂 | `stock_dashboard.py` `_commit_snapshot_and_history()` | 单 DATA_LOCK 内一次性 history + LATEST 提交 |
+| 32 | magic number 散落（20/15/8/5/600/240...）| `stock_dashboard.py` `DEFAULT_FETCH_*_TOP_N` 常量 | fetch_once 内显式使用常量名 |
+| 33 | watchdog 仍指向旧路径 `C:\Users\openclaw\stock_dashboard_tdx.py`（已删除）| `.hermes/scripts/dashboard_watchdog.py:19` 与 `.hermes/skills/productivity/stock-dashboard-frontend/scripts/dashboard_watchdog.py` | watchdog 现已失效；**用户后续动作**：(a) 删除两份副本；(b) 重写为指向 `C:\Mac\Home\Desktop\win_WorkSpace_ClaudeCode\Stock_Dashboard\stock_dashboard.py`；(c) 改用 `pythonw` 启动 + windows 服务模式 |
+| 34 | `stock_flow_push_tdx.py` 仍用 `datetime.now()` 本地时间 | `C:\Users\openclaw\stock_flow_push_tdx.py`（不在本看板范围）| **用户后续动作**：从 `stock_flow_push.py` 复制 `bj_now()` 函数到 `_tdx` 版本，替换所有 `datetime.now()`；或直接废弃 `_tdx` 版，只保留 `stock_flow_push.py` |
+
+---
+
+## 16. 安全审查清单（公网部署前必做）
+
+按 P3-4，部署到公网/共享网络前需逐项核验：
+
+| # | 项目 | 现状 | 缓解 |
+|---|---|---|---|
+| 1 | 默认绑定 `0.0.0.0` 暴露公网 | `main()` 默认 `bind_host = "0.0.0.0"` | 启动前 `set DASHBOARD_BIND=127.0.0.1` 或 Nginx 反代 |
+| 2 | 无访问控制 / 鉴权 | `Handler.do_GET` 无任何 token / IP 白名单 | 加 `Authorization` Bearer token，或 nginx basic_auth |
+| 3 | 静态文件白名单路由 | 已实现，但缺 `.json` mime 与 ETag | 已加 `Cache-Control: no-store`；建议加 ETag/304 |
+| 4 | 路径穿越 | `do_GET` else 分支已检查 `.. / / / \\` | ✅ 已防御 |
+| 5 | subprocess / eval / exec | 全代码无 `subprocess.Popen(shell=True)` 用户输入拼接、无 `eval/exec` | ✅ 已审计 |
+| 6 | 日志泄漏敏感数据 | stderr 走 `logs/`；无 token/webhook URL 写日志 | ✅ 安全 |
+| 7 | 飞书 webhook URL 泄漏 | `STOCK_FLOW_FEISHU_WEBHOOK` 仅在 `alert_monitor.py` 用，不写日志 | ✅ 安全 |
+| 8 | akshare SSRF | 仅访问官方公开数据源；URL 不可被外部输入控制 | ✅ 安全 |
+| 9 | HTTP 路径注入 | 路径仅在 `do_GET` 静态文件路由使用，无 shell 拼接 | ✅ 安全 |
+| 10 | 端口冲突 | 启动时未检测占用 | 加 `assert not is_port_in_use(port) → 抛错` |
+
+> 本节仅为**自检清单**，未跑实际渗透测试。公网部署前建议用 `bandit` / `safety` 等工具扫一遍 `stock_dashboard.py / tdx_client.py / alert_monitor.py`。
+
+---
+
+## 4. HTTP 接口
+
+| 路径 | 方法 | 返回 | 缓存 |
+|---|---|---|---|
+| `/` | GET | `dashboard.html` | no-store |
+| `/api/health` | GET | `{tdx_client_available, akshare_available, current_source, last_timestamp, last_error, tdx_health}` | no-store |
+| `/api/data` | GET | `{timestamp, is_trading, stock_top/bottom, industry_top/bottom, concept_top/bottom, market_net, source}` | no-store |
+| `/api/history` | GET | 全量 history 时序（开发用）| no-store |
+| `/api/trend` | GET | `{timestamps, stock, industry, concept, market, names: {stock,industry,concept}, market_net}` | no-store |
+| `/api/alerts` | GET | 异动监测状态 | no-store |
+| `/api/data/period_compare` | GET | 1d/3d/5d/10d 累计流入流出（akshare 兜底）| no-store |
+| `/api/data/daily_top?n=6` | GET | 最近 N 个交易日完整快照（含 industry/concept）| no-store |
+| `/api/data/latest` | GET | 最近一日完整 snapshot（休市兜底）| no-store |
+| `/<file>` | GET | 同目录白名单静态文件（`.js/.css/.html/.json/.png/.svg/.ico`）| no-store |
+| `<其余路径>` | — | 404 | — |
+
+---
+
+## 5. 后台线程清单
+
+| 线程 | 间隔 | 作用 | 启动 |
+|---|---|---|---|
+| `background_loop` | 180s | 主拉数：TDX 资金流 + akshare 兜底；写 LATEST + history | `main()` 中启动 |
+| `period_background_loop` | 600s | 拉 akshare 3/5/10 日排行 | `main()` 中启动 |
+| `daily_snapshot_loop` | 60s | 每日 15:30 后保存完整 snapshot 到 `LATEST["daily_summaries"]`（含 industry/concept）| `main()` 中启动 |
+| `alert_monitor._scan_loop` | 60s | 全市场异动扫描（仅 alert_monitor 模块）| alert_monitor 内启动 |
+
+---
+
+## 6. 数据流时序
+
+```
+T+0 (启动)
+  LATEST = {} （空）
+  fetch_once 第一次跑
+    → TDX 资金流（盘后全0）
+    → akshare 兜底（通常失败）
+    → snapshot 全空 → has_data=False → 不写 LATEST（保留空）
+    → history 也不追加
+  LATEST 仍为空，前端表格显示 "无数据"
+
+T+30s 第二次 fetch_once
+  → 继续空（盘后无数据）
+
+第二日 9:30-11:30 / 13:00-15:00 (盘中)
+  → fetch_once 拉到真实数据 → LATEST 填满
+  → history 累积每日多个时间点
+  → 前端表格实时更新
+
+第二日 15:30 后
+  → daily_snapshot_loop 触发 → 保存当日 LATEST 到 daily_summaries["YYYY-MM-DD"]
+  → 包含 stock_top/bottom + industry_top/bottom + concept_top/bottom
+
+第三日起
+  → 盘后 LATEST 实时为空（snapshot 已被覆盖）
+  → 但 daily_summaries 已累积，可从 daily_top?n=1 取最近一日
+```
+
+---
+
+## 7. 依赖
+
+### 外部依赖
+
+| 依赖 | 来源 | 用途 |
+|---|---|---|
+| Python | 3.11 / 3.12 / 3.13 | 运行时 |
+| 通达信 TdxQuant | `C:\new_tdx64\`（可改 `TDX_HOME`）| TQ 行情接口 |
+| `tqcenter` Python 绑定 | 通达信客户端自带的 Python 模块 | TdxQuant 调用入口 |
+| `akshare` | pip | 同花顺数据接口兜底 |
+| `psutil` | pip | 进程检查（可选）|
+| ECharts 5.4.3 | jsdelivr CDN（已本地化为 `echarts.min.js`）| 前端图表 |
+| Python 标准库 | — | `http.server`、`threading`、`json`、`datetime`、`urllib.parse` |
+
+### 安装命令
+
+```bash
+pip install akshare psutil
+# 通达信客户端自带 tqcenter，无需额外安装（但需安装到对应 Python 版本）
+```
+
+---
+
+## 8. 环境变量
+
+| 变量 | 默认值 | 说明 |
+|---|---|---|
+| `TDX_HOME` | `C:\new_tdx64` | 通达信客户端安装路径 |
+| `TDX_EXE_NAME` | `TdxW.exe` | 通达信客户端进程名 |
+| `TDX_CALL_TIMEOUT` | `8` | TdxQuant 单次调用超时（秒）|
+| `DASHBOARD_PORT` | `8765` | 看板 HTTP 端口 |
+| `DASHBOARD_BIND` | `0.0.0.0` | 绑定地址（容器化可改 `127.0.0.1`）|
+| `DASHBOARD_KEEP_PROXY` | `0` | `1`=保留系统代理；默认清掉 |
+| `STOCK_FLOW_FEISHU_WEBHOOK` | （空）| 飞书机器人 webhook；不填则异动仅 stdout |
+
+---
+
+## 9. 启动 / 重启 / 停止
+
+### 启动（推荐）
+
+```batch
+cd C:\Mac\Home\Desktop\win_WorkSpace_ClaudeCode\Stock_Dashboard
+start_dashboard.bat
+```
+
+### 直接启动
+
+```batch
+set PYTHONIOENCODING=utf-8
+set PYTHONUTF8=1
+python stock_dashboard.py
+```
+
+### 停止
+
+```powershell
+Get-NetTCPConnection -LocalPort 8765 -State Listen | ForEach-Object { Stop-Process -Id $_.OwningProcess -Force }
+Get-Process | Where-Object { $_.ProcessName -eq 'python' } | Stop-Process -Force
+```
+
+### 查看实时日志
+
+```powershell
+Get-Content C:\Mac\Home\Desktop\win_WorkSpace_ClaudeCode\Stock_Dashboard\logs\dashboard.stdout.log -Wait
+Get-Content C:\Mac\Home\Desktop\win_WorkSpace_ClaudeCode\Stock_Dashboard\logs\dashboard.stderr.log -Wait
+```
+
+---
+
+## 10. 验证清单（启动后必跑）
+
+```powershell
+# 1. 进程在跑
+Get-Process | Where-Object { $_.ProcessName -eq 'python' }
+
+# 2. 端口在听
+Get-NetTCPConnection -LocalPort 8765 -State Listen
+
+# 3. 健康检查
+(Invoke-WebRequest -Uri http://127.0.0.1:8765/api/health -UseBasicParsing).Content
+# {"tdx_client_available": true, "akshare_available": true, "current_source": "tdx", "tdx_health": "ok"}
+
+# 4. 数据接口
+(Invoke-WebRequest -Uri http://127.0.0.1:8765/api/data -UseBasicParsing).Content
+# 盘中应有非空 stock_top；盘后/未拉数时空
+
+# 5. 趋势接口
+(Invoke-WebRequest -Uri http://127.0.0.1:8765/api/trend -UseBasicParsing).Content
+
+# 6. 浏览器
+Start-Process 'http://localhost:8765/'
+```
+
+---
+
+## 11. 问题排查指南
+
+### Q1: 看板打开表格全部 "无数据"
+
+**A:** 拉数周期未跑过，或 fetch_once 拉到全空。
+- 检查 `logs/dashboard.stderr.log` 最后 20 行，看 `[bg] fetching` / `[bg-period] 3d done in` / `[bg-snapshot]` 等日志
+- 盘中：TDX 资金流应非空；非盘中：可能只有 `current_source=mixed(tdx+akshare)` 部分有数据
+- 盘后且历史未保存：浏览器顶部应显示 `⏸ 当前为非交易时段，显示最近 1 日数据`；若无此提示且仍空，检查 `/api/data/latest` 是否返回
+
+### Q2: 启动失败 / 端口已被占用
+
+**A:** 残留进程占用 8765。
+```powershell
+Get-NetTCPConnection -LocalPort 8765 -State Listen | ForEach-Object { Stop-Process -Id $_.OwningProcess -Force }
+```
+再重启 `start_dashboard.bat`。
+
+### Q3: TdxQuant 初始化失败（`return ID 小于 0`）
+
+**A:** 通达信客户端未启用 TQ 量化模块。
+1. 打开通达信客户端，登录行情账号
+2. 顶部菜单「设置」→「量化」勾选启用
+3. 重启客户端后再启动看板
+
+### Q4: 趋势图无折线
+
+**A:**
+- 数据问题：`/api/trend` 应返回 `timestamps` 数组 + `industry/stock/concept/market` 字典
+- 容器问题：检查 `trend-stock` 等 div 是否有显式高度
+- NaN 问题：检查 timestamps 是否都是 HH:MM 或 HH:MM:SS 格式（不能混用）
+- ECharts 版本：本地 `echarts.min.js` 是 5.4.3；若被替换为旧版可能不支持新 API
+
+### Q5: 折线图"近 6 个交易日"折线全 0 或显示"尚无数据"
+
+**A:** `LATEST["daily_summaries"]` 为空（首次启动 6 个交易日内）。
+- 项目刚迁移：等 6 天自动累积；或调用 `daily_snapshot_loop` 立即保存一次（手动触发）
+- 检查 stderr：`[daily-snapshot] 已保存 YYYY-MM-DD` 日志是否存在
+
+### Q6: 飞书推送没收到
+
+**A:** `STOCK_FLOW_FEISHU_WEBHOOK` 环境变量未设或 webhook URL 失效。
+- stderr 启动期会 WARNING："飞书 Webhook 未配置..."
+- 设环境变量后重启：异动会立即通过 webhook 推送
+
+### Q7: ECharts CDN 加载失败（出现 `echarts is not defined`）
+
+**A:** 检查 `<script src="./echarts.min.js">` 是否能被服务：访问 `http://localhost:8765/echarts.min.js` 应返回 1024 KB 文件。若 404，说明 `do_GET` 静态文件白名单未启用。
+
+### Q8: 字符乱码
+
+**A:** 中文显示是 `???` 或 `锟斤拷`：
+- 检查 stdout/stderr：PowerShell 默认 GBK
+- 启动时已设 `PYTHONIOENCODING=utf-8 PYTHONUTF8=1`
+- HTML 头部 `<meta charset="UTF-8">` 已设
+
+---
+
+## 12. 与更大项目集成的指引
+
+### 嵌入到主项目的方案
+
+#### 方案 A：作为独立 HTTP 服务（推荐）
+
+主项目通过 HTTP 调用本看板接口，纳入自己的网关：
+
+```python
+# 主项目调用示例
+import httpx
+async def get_a_stock_fund_flow():
+    async with httpx.AsyncClient() as c:
+        r = await c.get("http://localhost:8765/api/data")
+        return r.json()
+```
+
+#### 方案 B：作为子进程
+
+主项目启动本看板作为子进程，通过端口暴露数据：
+
+```python
+subprocess.Popen(["start_dashboard.bat"], cwd=stock_dashboard_dir)
+```
+
+#### 方案 C：内联嵌入
+
+直接把 `stock_dashboard.py` 中的 `LATEST` 数据结构、后台线程、HTTP handler 抽成独立模块，import 到主项目。
+
+### 集成时需注意
+
+1. **端口冲突**：主项目若占用 8765 需改 `DASHBOARD_PORT`
+2. **时区**：所有时间戳用 `bj_now_naive()`（北京时间），不要用 `datetime.now()`
+3. **线程安全**：读写 `LATEST` 必须持 `DATA_LOCK` 或 `FETCH_LOCK`
+4. **依赖安装**：主项目 environment 需装 `akshare`；通达信 tqcenter 仅在 Windows + 通达信客户端环境可用
+5. **dogpile effect**：如果主项目自身频繁调用 `/api/data`，建议前端缓存 30s（看板前端已设 `cache: "no-store"`，按需调整）
+
+### 提取核心数据模块的最小代码骨架
+
+```python
+# 仅取 LATEST 缓存 + 后台拉数（去掉 HTTP 层）：
+from stock_dashboard import LATEST, background_loop, DATA_LOCK
+
+# 在自己的线程里跑
+threading.Thread(target=background_loop, args=(180,), daemon=True).start()
+
+# 读 LATEST
+with DATA_LOCK:
+    data = dict(LATEST)
+```
+
+### 提取静态前端
+
+`dashboard.html` + `echarts.min.js` 可独立部署到任何静态服务器（nginx / GitHub Pages），只要配置 API 反向代理到 `localhost:8765`。
+
+---
+
+## 13. 已知遗留问题
+
+| 问题 | 影响 | 解决方案（暂未实施）|
+|---|---|---|
+| watchdog 路径漂移 | `.hermes/scripts/dashboard_watchdog.py` 仍守护 `C:\Users\openclaw\stock_dashboard_tdx.py`（已归档）| 后续重写 watchdog 或弃用 |
+| 实时拉数 BASEHTTPR equestHandler 同步阻塞 | 慢请求会阻塞其他请求 30s+ | 改用 ThreadingHTTPServer + per-request thread，或切换到 aiohttp / FastAPI |
+| `industry/concept` 历史只有累计值 | 趋势图是当日累积曲线，不能看盘中分时占比 | 增加 `tq.get_minute_time()` 等盘中分时接口 |
+| 日内累积曲线 vs 当日截面对比 | T-5..T 折线图是每只股的净额，趋势图是行业/概念累计（不同语义）| 在前端 UI 区分命名 + hover 说明 |
+| `fetch_once` 仍可能 hang 在 `tq.get_market_snapshot` | 已有 `_call_with_timeout`，但单次 hang 会持续到下次 init | 增加 `init(force=True)` 触发条件 |
+
+---
+
+## 14. 变更历史
+
+| 日期 | 变更 |
+|---|---|
+| 2026-08-08 | 从 `C:\Users\openclaw\` 根目录接管，建立 `Stock_Dashboard/` |
+| 2026-08-08 | 修复 GBK emoji 崩溃、TDX 路径硬编码、静态资源 404、趋势图 NaN、折线图元素堆叠 |
+| 2026-08-08 | 增加 `daily_snapshot_loop` + `period_background_loop` 后台线程 |
+| 2026-08-08 | 增加 `/api/data/latest` 休市兜底 |
+| 2026-08-08 | 清除所有 `_DEMO_*` 临时数据，文件清爽就绪 |
+| 2026-08-08 | 编写本 LOG.md |
+| 2026-08-09 | 全项目 review + P0/P1 修复：HTTPServer → ThreadingHTTPServer；handler 内统一 `_send_json_response`（锁外序列化 + 断连 try/except）；后台线程 daemon → stop_event + join；fetch_once watchdog；history series LRU 500 + `del` 裁剪；window resize rAF 节流；path traversal 返 JSON 400。|
+
+---
+
+## 15. 联系与维护
+
+- 看板作者：openclaw
+- 数据源版权：通达信 TdxQuant、akshare 同花顺接口
+- 项目路径：`C:\Mac\Home\Desktop\win_WorkSpace_ClaudeCode\Stock_Dashboard\`
+- 旧位置（已迁移）：`C:\Users\openclaw\stock_dashboard.py` 等
+
+如需重构或与更大项目集成，请先阅读本 LOG.md 第 11/12 章。
