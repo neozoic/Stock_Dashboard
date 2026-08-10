@@ -1,5 +1,11 @@
 # A 股资金流实时看板（Stock_Dashboard）
 
+[![GitHub](https://img.shields.io/badge/GitHub-neozoic%2FStock__Dashboard-181717?logo=github)](https://github.com/neozoic/Stock_Dashboard)
+[![Gitee](https://img.shields.io/badge/Gitee-neozoic%2Fstock__dashboard-c71d23?logo=gitee)](https://gitee.com/neozoic/stock_-dashboard)
+[![License](https://img.shields.io/badge/license-MIT-blue)](LICENSE)
+[![Python](https://img.shields.io/badge/python-3.11%2B-blue?logo=python)](https://www.python.org)
+[![Status](https://img.shields.io/badge/status-active-brightgreen)]()
+
 通达信 TdxQuant 主源 + akshare 兜底的实时 A 股资金流看板，提供：
 
 - 个股 / 行业 / 概念板块的"流入 vs 流出"对比表
