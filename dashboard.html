@@ -986,6 +986,19 @@ function nextOpenCountdown(now, tz, openHour, openMinute, sessions, extra) {
     return _calcNextOpen(now, tz, parts, wdMap, workdays, y, mo, d, curMin, s, openHour, openMinute);
   }
 
+  // 盘前(早于当日首个 session 起点):统一显示"距开盘 N 分钟",
+  // 不再 fall through 到 _calcNextOpen(否则会算下个工作日,显示 24h+)
+  if (sessions.length > 0) {
+    const sortedSess = [...sessions].sort((a, b) => (a[0] * 60 + a[1]) - (b[0] * 60 + b[1]));
+    const firstStart = sortedSess[0][0] * 60 + sortedSess[0][1];
+    if (curMin < firstStart) {
+      // 用 nextOpenCountdown 自己的 firstStart 算今天开盘 ms
+      const nextUtc = _composeNextUtc(parts, wdMap, workdays, now, firstStart, openHour, openMinute, tz);
+      const remainMs = nextUtc - now.getTime();
+      return { state: "closed", text: `距开盘 ${fmtDuration(remainMs)}` };
+    }
+  }
+
   if (overnight.length > 0) {
     const o1 = overnight[0];
     if (curMin >= o1[0] * 60 + o1[1] && curMin < o1[2] * 60 + o1[3]) {
@@ -1033,8 +1046,8 @@ function nextOpenCountdown(now, tz, openHour, openMinute, sessions, extra) {
   return _calcNextOpen(now, tz, parts, wdMap, workdays, y, mo, d, curMin, s, openHour, openMinute);
 }
 
-function _calcNextOpen(now, tz, parts, wdMap, workdays, y, mo, d, curMin, s, openHour, openMinute) {
-  // 构造固定的 nextUtc：目标工作日在 tz 下的 09:30:00 对应的 UTC 毫秒。
+function _composeNextUtc(parts, wdMap, workdays, now, targetStartMin, openHour, openMinute, tz) {
+  // 构造"目标工作日"的"年-月-日 在 tz 下的 09:30:00"对应的 UTC 毫秒。
   // 关键:不把 gSec 加进去,否则 nextUtc 会随 now 的秒数同步偏移,导致 remain 永远不变。
   const targetFmt = new Intl.DateTimeFormat("en-CA", {
     timeZone: tz, hour12: false, weekday: "short",
@@ -1062,14 +1075,25 @@ function _calcNextOpen(now, tz, parts, wdMap, workdays, y, mo, d, curMin, s, ope
       parseInt(gp.minute, 10),
       parseInt(gp.second, 10)
     );
-    // tz 下"目标日 09:30:00"对应的 UTC 时刻
-    const nextUtc = localDayStartUtc + tzOffset + openHour * 3600 * 1000 + openMinute * 60 * 1000;
+    // tz 下"目标日 targetStartMin:00"对应的 UTC 时刻
+    const targetH = Math.floor(targetStartMin / 60);
+    const targetM = targetStartMin % 60;
+    const nextUtc = localDayStartUtc + tzOffset + targetH * 3600 * 1000 + targetM * 60 * 1000;
     if (nextUtc > now.getTime()) {
-      const remain = nextUtc - now.getTime();
-      return { state: "closed", text: `距开盘 ${fmtDuration(remain)}` };
+      return nextUtc;
     }
   }
-  return { state: "closed", text: "已收盘" };
+  return null;
+}
+
+function _calcNextOpen(now, tz, parts, wdMap, workdays, y, mo, d, curMin, s, openHour, openMinute) {
+  // 默认找下个工作日 09:30 开市
+  const nextUtc = _composeNextUtc(parts, wdMap, workdays, now, openHour * 60 + openMinute, openHour, openMinute, tz);
+  if (nextUtc === null) {
+    return { state: "closed", text: "已收盘" };
+  }
+  const remain = nextUtc - now.getTime();
+  return { state: "closed", text: `距开盘 ${fmtDuration(remain)}` };
 }
 
 function fmtDuration(ms) {
