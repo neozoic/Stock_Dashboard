@@ -17,6 +17,11 @@ TdxQuant 客户端包装模块
   - get_sector_stocks(code)   拿板块成分股
   - get_snapshot(code)        单股快照（标准化字段名）
   - get_fund_flow(code)       单股资金流（主力净流入、撤单、封单、多周期涨幅）
+  - get_minute_bars(codes, period='1m')
+                             K线/分时数据（get_market_data 封装，读本地已下载数据）
+  - get_formula_indicator(formula, arg, stock_code=...)
+                             内置公式指标（formula_zb 封装，白名单 MA/KDJ/MACD/...）
+  - send_warn_signals(...)    推送预警信号到 TQ 策略信号窗口（send_warn 封装）
   - batch_snapshot(codes, callback, max_workers=8)
                              批量快照（线程池并发，断线自动重试）
 
@@ -35,15 +40,13 @@ import time
 import logging
 import threading
 from concurrent.futures import ThreadPoolExecutor, as_completed
-from typing import Dict, List, Optional, Callable, Any
+from typing import Dict, List, Optional
 
 # === 必须在 import tqcenter 之前设置 PATH，否则 LoadLibrary 失败 ===
 # 路径可通过 TDX_HOME / TDX_EXE_NAME 环境变量覆盖，便于迁移主机。
 TDX_HOME = os.environ.get("TDX_HOME", r"C:\new_tdx64")
 TDX_PYPLUGINS = os.path.join(TDX_HOME, "PYPlugins")
 TDX_EXE_NAME = os.environ.get("TDX_EXE_NAME", "TdxW.exe")
-_TDX_HOME = TDX_HOME
-_TDX_PYPLUGINS = TDX_PYPLUGINS
 _TDX_EXE = os.path.join(TDX_HOME, TDX_EXE_NAME)
 _TDX_DLL = os.path.join(TDX_PYPLUGINS, "TPythClient.dll")
 
@@ -55,13 +58,13 @@ _TDX_PROCESS_NAMES = (TDX_EXE_NAME,)
 
 if sys.platform == "win32":
     # 让 Windows 能找到兄弟 DLL（tdxrpc64.dll 等）
-    for d in (_TDX_HOME, _TDX_PYPLUGINS):
+    for d in (TDX_HOME, TDX_PYPLUGINS):
         if d not in os.environ.get("PATH", ""):
             os.environ["PATH"] = d + ";" + os.environ.get("PATH", "")
     try:
         # Python 3.8+ 推荐方式
-        os.add_dll_directory(_TDX_HOME)
-        os.add_dll_directory(_TDX_PYPLUGINS)
+        os.add_dll_directory(TDX_HOME)
+        os.add_dll_directory(TDX_PYPLUGINS)
     except (AttributeError, OSError):
         pass
 
@@ -119,9 +122,10 @@ def _check_tdx_process_alive() -> bool:
     try:
         import subprocess
         # 用 PowerShell 查，避免 tasklist 的 stdout 编码问题
-        # Get-Process -Name TdxW 抛异常=没找到；返回数组=找到
+        # Get-Process -Name <进程名> 抛异常=没找到；返回数组=找到
+        proc_name = os.path.splitext(TDX_EXE_NAME)[0]
         ps_cmd = (
-            "$p = Get-Process -Name TdxW -ErrorAction SilentlyContinue; "
+            f"$p = Get-Process -Name {proc_name} -ErrorAction SilentlyContinue; "
             "if ($p) { 'FOUND:' + $p.Count } else { 'NONE' }"
         )
         out = subprocess.run(
@@ -367,15 +371,19 @@ def _ensure_ready() -> None:
 TDX_CALL_TIMEOUT = float(os.environ.get("TDX_CALL_TIMEOUT", "8"))  # 秒
 
 
-def _call_with_timeout(func, *args, timeout=None, default=None, label=""):
-    """在独立线程中调用 func，超时返回 default。"""
+def _call_with_timeout(func, *args, timeout=None, default=None, label="", **kwargs):
+    """在独立线程中调用 func，超时返回 default。
+
+    *args/**kwargs 透传给 func:支持像 get_stock_list(market="5", list_type=1) 这类
+    带关键字参数的 TdxQuant 调用。
+    """
     if timeout is None:
         timeout = TDX_CALL_TIMEOUT
     box = {}
 
     def runner():
         try:
-            box["value"] = func(*args)
+            box["value"] = func(*args, **kwargs)
         except Exception as e:
             box["error"] = e
         finally:
@@ -603,8 +611,248 @@ def get_fund_flow(code: str) -> Dict:
 
 
 # ============================================================
+# K线 / 分时数据（get_market_data）
+# ============================================================
+
+# get_market_data 读的是本地已下载数据，盘后/未下载时可能为空 —— 空数据是正常返回，不是错误
+_MARKET_DATA_FIELDS = ["Open", "High", "Low", "Close", "Volume", "Amount"]
+
+
+def _fmt_bar_time(t) -> str:
+    """把时间轴元素（pandas Timestamp / int yyyymmddHHMMSS / str）格式化成 'YYYY-MM-DD HH:MM:SS'。"""
+    s = str(t)
+    if s.isdigit():
+        if len(s) >= 14:
+            return f"{s[0:4]}-{s[4:6]}-{s[6:8]} {s[8:10]}:{s[10:12]}:{s[12:14]}"
+        if len(s) == 8:
+            return f"{s[0:4]}-{s[4:6]}-{s[6:8]}"
+    return s
+
+
+def _to_py_number(v):
+    """numpy/pandas 标量 -> python int/float/str/None（NaN/NaT 归一为 None），保证 json.dumps 可用。"""
+    if v is None:
+        return None
+    try:
+        if v != v:  # NaN / NaT
+            return None
+    except Exception:
+        return str(v)
+    if isinstance(v, bool):
+        return v
+    if isinstance(v, (int, float)):
+        return v
+    try:
+        f = float(v)
+    except (TypeError, ValueError):
+        return str(v)
+    return int(f) if f.is_integer() else f
+
+
+def get_minute_bars(stock_list, period: str = "1m", count: Optional[int] = None,
+                    start_time: str = "", end_time: str = "",
+                    dividend_type: str = "none") -> Optional[Dict[str, Dict]]:
+    """
+    获取 K 线/分时数据（tq.get_market_data 封装，走 _call_with_timeout）。
+
+    Args:
+        stock_list: 股票/板块代码列表（或单个 code 字符串）
+        period: '1m','5m','15m','30m','1h','1d','1w','1mon'
+        count: 条数（None/-1 = 全部）
+        start_time/end_time: 'YYYYMMDD'，空串表示不限制
+
+    Returns:
+        None: 调用失败/超时/TDX 未就绪（调用方应视为 503）
+        dict: {code: {"timestamps": [...], "Open": [...], "High": [...], "Low": [...],
+                      "Close": [...], "Volume": [...], "Amount": [...]}}
+              盘后/本地未下载时返回空 dict —— 属正常情况，调用方返回空数组即可
+    """
+    if isinstance(stock_list, str):
+        stock_list = [stock_list]
+    if not stock_list:
+        return {}
+    if not _ensure_ready_silent():
+        return None
+    raw = _call_with_timeout(
+        tq.get_market_data,
+        field_list=list(_MARKET_DATA_FIELDS),
+        stock_list=list(stock_list),
+        period=period,
+        start_time=start_time,
+        end_time=end_time,
+        count=count if count else -1,
+        dividend_type=dividend_type,
+        fill_data=True,
+        default=None,
+        label=f"get_market_data({period},{len(stock_list)} codes)",
+    )
+    if raw is None:
+        return None
+    if not isinstance(raw, dict):
+        return {}
+    out: Dict[str, Dict] = {c: {"timestamps": []} for c in stock_list}
+    ts_filled = False
+    for field in _MARKET_DATA_FIELDS:
+        df = raw.get(field)
+        if df is None:
+            continue
+        try:
+            cols = set(df.columns)
+        except AttributeError:
+            continue
+        if not ts_filled:
+            try:
+                idx = [_fmt_bar_time(t) for t in list(df.index)]
+            except Exception:
+                idx = []
+            for c in stock_list:
+                out[c]["timestamps"] = idx
+            ts_filled = True
+        for c in stock_list:
+            if c not in cols:
+                continue
+            try:
+                out[c][field] = [_to_py_number(v) for v in list(df[c])]
+            except Exception:
+                continue
+    # 丢弃完全无数据的 code（timestamps 为空且没有任何字段）
+    return {c: d for c, d in out.items() if d.get("timestamps") or len(d) > 1}
+
+
+# ============================================================
+# 预警信号回推（send_warn）
+# ============================================================
+
+_SEND_FAIL = object()  # 哨兵：区分"调用成功但返回 None"与"超时/异常"
+
+
+def send_warn_signals(stock_list, time_list, price_list, bs_flag_list,
+                      close_list, reason_list) -> bool:
+    """
+    推送预警信号到通达信 TQ 策略信号窗口（tq.send_warn 封装）。
+
+    Args:
+        bs_flag_list: 0=买(红B), 1=卖(绿S), 2=未知(黄双叠三角)
+        time_list: 'YYYYMMDDHHMMSS' 格式
+
+    Returns:
+        True=调用成功（send_warn 成功时返回 None，用哨兵区分）；False=未就绪/超时/异常。
+        任何失败都不抛异常。
+    """
+    n = len(stock_list or [])
+    if n == 0:
+        return False
+    if not _ensure_ready_silent():
+        return False
+    res = _call_with_timeout(
+        tq.send_warn,
+        stock_list=list(stock_list),
+        time_list=list(time_list),
+        price_list=[float(p or 0) for p in price_list],
+        bs_flag_list=[int(b) for b in bs_flag_list],
+        close_list=[float(c or 0) for c in close_list],
+        reason_list=[str(r) for r in reason_list],
+        count=n,
+        default=_SEND_FAIL,
+        label=f"send_warn({n} signals)",
+    )
+    return res is not _SEND_FAIL
+
+
+# ============================================================
+# 内置公式指标（formula_zb）
+# ============================================================
+
+# tq.formula_zb 支持的内置公式白名单（见 通达信TQ策略接口列表.md）
+BUILTIN_FORMULAS = ("MA", "KDJ", "MACD", "BOLL", "VOL", "RSI", "WR", "DMA", "ASI")
+
+
+def _jsonable(obj):
+    """递归转 JSON 友好类型（dict/list/numpy 标量/NaN->None）。"""
+    if isinstance(obj, dict):
+        return {str(k): _jsonable(v) for k, v in obj.items()}
+    if isinstance(obj, (list, tuple)):
+        return [_jsonable(v) for v in obj]
+    if hasattr(obj, "tolist"):  # numpy array / pandas Series
+        try:
+            return _jsonable(obj.tolist())
+        except Exception:
+            return str(obj)
+    if isinstance(obj, bool) or obj is None or isinstance(obj, (int, str)):
+        return obj
+    try:
+        f = float(obj)
+        if f != f:  # NaN
+            return None
+        return f
+    except (TypeError, ValueError):
+        return str(obj)
+
+
+def get_formula_indicator(formula_name: str, formula_arg: str = "",
+                          stock_code: Optional[str] = None,
+                          period: str = "1d", count: int = 120,
+                          xsflag: int = 0) -> Optional[Dict]:
+    """
+    计算内置公式指标（tq.formula_zb 封装，走 _call_with_timeout）。
+
+    Args:
+        formula_name: 必须在 BUILTIN_FORMULAS 白名单内，否则抛 ValueError
+        formula_arg: 公式参数，如 '9,3,3'
+        stock_code: 非空时先调 formula_set_data_info 绑定数据上下文（best-effort）
+        period/count: 绑定数据上下文用的周期与条数
+
+    Returns:
+        None: 失败/超时/TDX 未就绪
+        dict: {stock_code: {indicator: [values]}}（已转 JSON 友好类型）
+    """
+    name = (formula_name or "").strip().upper()
+    if name not in BUILTIN_FORMULAS:
+        raise ValueError(f"公式不在白名单: {formula_name}")
+    if not _ensure_ready_silent():
+        return None
+    if stock_code:
+        _call_with_timeout(
+            tq.formula_set_data_info, stock_code, period, int(count), "none",
+            default=None, label=f"formula_set_data_info({stock_code})",
+        )
+    raw = _call_with_timeout(
+        tq.formula_zb,
+        formula_name=name, formula_arg=formula_arg, xsflag=int(xsflag),
+        default=None, label=f"formula_zb({name})",
+    )
+    if raw is None:
+        return None
+    return _jsonable(raw)
+
+
+# ============================================================
 # 批量并发
 # ============================================================
+
+def _batch_run(func, codes, max_workers, timeout, result_timeout, label, require_code=False):
+    """批量并发的公共骨架：submit func → as_completed 收集 → 跳过失败。"""
+    if not codes:
+        return []
+    if not _ensure_ready_silent():
+        return []
+
+    results: List[Dict] = []
+    with ThreadPoolExecutor(max_workers=max_workers) as ex:
+        future_to_code = {ex.submit(func, c): c for c in codes}
+        deadline = time.time() + timeout
+        for fut in as_completed(future_to_code, timeout=timeout):
+            if time.time() > deadline:
+                break
+            code = future_to_code[fut]
+            try:
+                item = fut.result(timeout=result_timeout)
+                if item and (not require_code or item.get("code")):
+                    results.append(item)
+            except Exception as e:
+                logger.debug("%s %s 失败: %s", label, code, e)
+    return results
+
 
 def batch_snapshot(
     codes: List[str],
@@ -622,26 +870,8 @@ def batch_snapshot(
     Returns:
         成功获取的快照列表（失败的代码会跳过，不抛异常）
     """
-    if not codes:
-        return []
-    if not _ensure_ready_silent():
-        return []
-
-    results: List[Dict] = []
-    with ThreadPoolExecutor(max_workers=max_workers) as ex:
-        future_to_code = {ex.submit(get_snapshot, c): c for c in codes}
-        deadline = time.time() + timeout
-        for fut in as_completed(future_to_code, timeout=timeout):
-            if time.time() > deadline:
-                break
-            code = future_to_code[fut]
-            try:
-                snap = fut.result(timeout=5)
-                if snap:
-                    results.append(snap)
-            except Exception as e:
-                logger.debug("batch_snapshot %s 失败: %s", code, e)
-    return results
+    return _batch_run(get_snapshot, codes, max_workers, timeout,
+                      result_timeout=5, label="batch_snapshot")
 
 
 def batch_fund_flow(
@@ -650,26 +880,8 @@ def batch_fund_flow(
     timeout: float = 60.0,
 ) -> List[Dict]:
     """批量获取资金流（更慢，建议并发略低）。"""
-    if not codes:
-        return []
-    if not _ensure_ready_silent():
-        return []
-
-    results: List[Dict] = []
-    with ThreadPoolExecutor(max_workers=max_workers) as ex:
-        future_to_code = {ex.submit(get_fund_flow, c): c for c in codes}
-        deadline = time.time() + timeout
-        for fut in as_completed(future_to_code, timeout=timeout):
-            if time.time() > deadline:
-                break
-            code = future_to_code[fut]
-            try:
-                flow = fut.result(timeout=10)
-                if flow and flow.get("code"):
-                    results.append(flow)
-            except Exception as e:
-                logger.debug("batch_fund_flow %s 失败: %s", code, e)
-    return results
+    return _batch_run(get_fund_flow, codes, max_workers, timeout,
+                      result_timeout=10, label="batch_fund_flow", require_code=True)
 
 
 def _ensure_ready_silent() -> bool:

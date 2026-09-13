@@ -1,6 +1,6 @@
 # Stock_Dashboard 项目日志
 
-> 最后更新：2026-08-08
+> 最后更新：2026-09-07
 > 接管来源：`C:\Users\openclaw\` 根目录散落的 Python 脚本 + 通达信数据源
 
 ---
@@ -81,8 +81,8 @@ A 股资金流实时看板：
 | 30 | ECharts 每 10s 全量重建 series | `dashboard.html` `_setChartOption()` |首次 notMerge=true 建模，后续 merge 模式只刷数据 |
 | 31 | history series 与 LATEST 双锁更新可能撕裂 | `stock_dashboard.py` `_commit_snapshot_and_history()` | 单 DATA_LOCK 内一次性 history + LATEST 提交 |
 | 32 | magic number 散落（20/15/8/5/600/240...）| `stock_dashboard.py` `DEFAULT_FETCH_*_TOP_N` 常量 | fetch_once 内显式使用常量名 |
-| 33 | watchdog 仍指向旧路径 `C:\Users\openclaw\stock_dashboard_tdx.py`（已删除）| `.hermes/scripts/dashboard_watchdog.py:19` 与 `.hermes/skills/productivity/stock-dashboard-frontend/scripts/dashboard_watchdog.py` | watchdog 现已失效；**用户后续动作**：(a) 删除两份副本；(b) 重写为指向 `C:\Mac\Home\Desktop\win_WorkSpace_ClaudeCode\Stock_Dashboard\stock_dashboard.py`；(c) 改用 `pythonw` 启动 + windows 服务模式 |
-| 34 | `stock_flow_push_tdx.py` 仍用 `datetime.now()` 本地时间 | `C:\Users\openclaw\stock_flow_push_tdx.py`（不在本看板范围）| **用户后续动作**：从 `stock_flow_push.py` 复制 `bj_now()` 函数到 `_tdx` 版本，替换所有 `datetime.now()`；或直接废弃 `_tdx` 版，只保留 `stock_flow_push.py` |
+| 33 | watchdog 仍指向旧路径 `C:\Users\openclaw\stock_dashboard_tdx.py`（已删除）| `.hermes/scripts/dashboard_watchdog.py:19` 与 `.hermes/skills/productivity/stock-dashboard-frontend/scripts/dashboard_watchdog.py` | ✅ 2026-09-05 已解决：权威版重写为 `tools/dashboard_watchdog.py`（路径自定位、env 对齐 start_dashboard.bat），两份 `.hermes` 副本改为 thin wrapper 转发调用，hermes cron 注册无需变更 |
+| 34 | `stock_flow_push_tdx.py` 仍用 `datetime.now()` 本地时间 | `C:\Users\openclaw\stock_flow_push_tdx.py`（不在本看板范围）| ✅ 2026-09-05 已解决：已从 `stock_flow_push.py` 复制 `BJ_TZ` + `bj_now()`，3 处 `datetime.now()` 全部替换 |
 
 ---
 
@@ -101,7 +101,7 @@ A 股资金流实时看板：
 | 7 | 飞书 webhook URL 泄漏 | `STOCK_FLOW_FEISHU_WEBHOOK` 仅在 `alert_monitor.py` 用，不写日志 | ✅ 安全 |
 | 8 | akshare SSRF | 仅访问官方公开数据源；URL 不可被外部输入控制 | ✅ 安全 |
 | 9 | HTTP 路径注入 | 路径仅在 `do_GET` 静态文件路由使用，无 shell 拼接 | ✅ 安全 |
-| 10 | 端口冲突 | 启动时未检测占用 | 加 `assert not is_port_in_use(port) → 抛错` |
+| 10 | 端口冲突 | ~~启动时未检测占用~~ ✅ 2026-09-05 已解决 | `main()` 启动前 `_is_port_in_use()` 自检，占用时打印清理命令并 exit 2 |
 
 > 本节仅为**自检清单**，未跑实际渗透测试。公网部署前建议用 `bandit` / `safety` 等工具扫一遍 `stock_dashboard.py / tdx_client.py / alert_monitor.py`。
 
@@ -120,6 +120,8 @@ A 股资金流实时看板：
 | `/api/data/period_compare` | GET | 1d/3d/5d/10d 累计流入流出（akshare 兜底）| no-store |
 | `/api/data/daily_top?n=6` | GET | 最近 N 个交易日完整快照（含 industry/concept）| no-store |
 | `/api/data/latest` | GET | 最近一日完整 snapshot（休市兜底）| no-store |
+| `/api/minute?code=600519.SH&period=1m&count=N` | GET | 单股/板块 K线分时（tq.get_market_data，读本地已下载数据；TDX 不可用 503，无数据 200 空数组）| no-store |
+| `/api/indicator?code=600519.SH&formula=KDJ&arg=9,3,3` | GET | 内置公式指标（tq.formula_zb；formula 白名单 MA/KDJ/MACD/BOLL/VOL/RSI/WR/DMA/ASI，白名单外 400，TDX 不可用 503）| no-store |
 | `/<file>` | GET | 同目录白名单静态文件（`.js/.css/.html/.json/.png/.svg/.ico`）| no-store |
 | `<其余路径>` | — | 404 | — |
 
@@ -201,6 +203,7 @@ pip install akshare psutil
 | `DASHBOARD_BIND` | `0.0.0.0` | 绑定地址（容器化可改 `127.0.0.1`）|
 | `DASHBOARD_KEEP_PROXY` | `0` | `1`=保留系统代理；默认清掉 |
 | `STOCK_FLOW_FEISHU_WEBHOOK` | （空）| 飞书机器人 webhook；不填则异动仅 stdout |
+| `TDX_SEND_WARN` | `1` | 异动信号回推通达信 TQ 策略信号窗口（tq.send_warn）；`0`=关闭 |
 
 ---
 
@@ -379,13 +382,13 @@ with DATA_LOCK:
 
 ## 13. 已知遗留问题
 
-| 问题 | 影响 | 解决方案（暂未实施）|
+| 问题 | 影响 | 解决方案 |
 |---|---|---|
-| watchdog 路径漂移 | `.hermes/scripts/dashboard_watchdog.py` 仍守护 `C:\Users\openclaw\stock_dashboard_tdx.py`（已归档）| 后续重写 watchdog 或弃用 |
-| 实时拉数 BASEHTTPR equestHandler 同步阻塞 | 慢请求会阻塞其他请求 30s+ | 改用 ThreadingHTTPServer + per-request thread，或切换到 aiohttp / FastAPI |
-| `industry/concept` 历史只有累计值 | 趋势图是当日累积曲线，不能看盘中分时占比 | 增加 `tq.get_minute_time()` 等盘中分时接口 |
+| ~~watchdog 路径漂移~~ ✅ 2026-09-05 已解决 | 旧副本守护已归档脚本 | 权威版重写为 `tools/dashboard_watchdog.py`（路径自定位）；`.hermes` 两份副本改为 thin wrapper 转发调用 |
+| 实时拉数 BASEHTTPR equestHandler 同步阻塞 | 慢请求会阻塞其他请求 30s+ | 已改 ThreadingHTTPServer（2026-08-09）；如需更高并发可再切 aiohttp / FastAPI |
+| `industry/concept` 历史只有累计值 | 趋势图是当日累积曲线，不能看盘中分时占比 | 已提供 `GET /api/minute`（tq.get_market_data 分钟线封装，tdx_client.get_minute_bars）；前端接入待做 |
 | 日内累积曲线 vs 当日截面对比 | T-5..T 折线图是每只股的净额，趋势图是行业/概念累计（不同语义）| 在前端 UI 区分命名 + hover 说明 |
-| `fetch_once` 仍可能 hang 在 `tq.get_market_snapshot` | 已有 `_call_with_timeout`，但单次 hang 会持续到下次 init | 增加 `init(force=True)` 触发条件 |
+| ~~`fetch_once` 仍可能 hang~~ ✅ 2026-09-05 已解决 | 单次 hang 会持续到下次 init | `background_loop` 已加连续超时计数：超时后下一轮前 `init(force=True)` 强制重连（init 本身包 30s 超时）|
 
 ---
 
@@ -400,6 +403,10 @@ with DATA_LOCK:
 | 2026-08-08 | 清除所有 `_DEMO_*` 临时数据，文件清爽就绪 |
 | 2026-08-08 | 编写本 LOG.md |
 | 2026-08-09 | 全项目 review + P0/P1 修复：HTTPServer → ThreadingHTTPServer；handler 内统一 `_send_json_response`（锁外序列化 + 断连 try/except）；后台线程 daemon → stop_event + join；fetch_once watchdog；history series LRU 500 + `del` 裁剪；window resize rAF 节流；path traversal 返 JSON 400。|
+| 2026-09-05 | 接入未用 TQ 能力：tdx_client 新增 `get_minute_bars` / `send_warn_signals` / `get_formula_indicator`（均走 `_call_with_timeout`）；看板新增 `/api/minute` 与 `/api/indicator`（400/503 语义明确）；alert_monitor 异动经 `tq.send_warn` 回推 TQ 信号窗口（`TDX_SEND_WARN` 开关，bs_flag：涨停/大单流入=0、跌停=1、其他=2）。|
+| 2026-09-05 | watchdog 重写：`tools/dashboard_watchdog.py` 为权威版（路径自定位、env 对齐 start_dashboard.bat），`.hermes` 两份旧副本改 thin wrapper；`stock_flow_push_tdx.py` 时区修复（bj_now）；`main()` 启动前端口占用自检（占用时打印清理命令并 exit 2）；`background_loop` 连续超时后 `init(force=True)` 强制重连；根目录散脚本归档 `archive/tq_experiments/`；`tdx_quant.pdf` 全文提取至 `../tdx_quant.txt` 并向 `../通达信TQ策略接口列表.md` 补录 6 个遗漏接口（get_bkjy_value/get_scjy_value 等）。|
+| 2026-09-07 | 盘中修复"看板内容显示不全"：① `fetch_akshare_fallback` 缺失 `return snap`（概念板块抓取代码错位成 `build_period_compare` return 后的死代码），导致 akshare 兜底恒返回 None、报错"akshare: 也不可用"——已把概念抓取 + return 移回；② akshare 1.18.x `stock_fund_flow_individual` 写死列数，10jqka 脏页混入即 ValueError——新增列数宽容版 `fetch_ths_fund_flow_individual`（复用 akshare hexin-v 签名，逐页校验列数、跳过脏页），即时 + 3/5/10/20 日排行统一走它，N 日排行改按"资金流入净额"排序；③ TDX 资金流全 0（level-1 客户端 TQ 不下发分类数据）时新增粘性跳过：连续 2 轮全 0 后 15 分钟内跳过 ~90s 的全 A 股 TDX 主拉，直接 akshare 兜底（一轮 ~30s）；④ `background_loop` watchdog 假阳性修复：`fetch_once` 正常返回也是 None，与原 `default=None` 的超时返回值不可区分，导致每轮都被误判超时、每轮强制重建 TDX 连接（此前"连续 241 轮超时"全为假阳性）——改用 `object()` 哨兵区分。akshare 顺带升级 1.18.55 → 1.18.94。|
+| 2026-09-12 | 审美优化迭代（不改运行时行为）。**前端 dashboard.html 重设计**：页面重组为 5 个分区（总览/榜单/日线回看/盘中趋势/工具）并加分隔标题；大盘净流入趋势从页底提升至首屏，与 KPI×4 组成 hero 区（宽屏 400px+1fr）；行业/概念趋势宽屏并排两列；图表高度与滚动区收敛为 CSS 类（`h-trend`/`h-daily`/`scroll-h250/380`），消灭内联样式；表格加极淡斑马纹；设计令牌补 `--up-bg`/`--down-bg`；JS 清理：`toNumber`/`parseAmountToYi` 合并为 `parseYi`（无效输入 null）+ `toNumber`（兜底 0）；修复 `setMeta` 忽略形参、`renderDualIndustryTable` 死三元（恒为"行业"键）；3 个 1s setInterval 合并为单一心跳；趋势图 X/Y 轴配置抽 `TRADING_X_AXIS`/`netYAxis` 共享。**后端低风险清理 ×16**：修复 alert_monitor 独立 init 隐性 bug（`from tdx_client import TDX_EXE` → `_TDX_EXE`，原 ImportError 被内层 except 吞掉导致四种 run_mode 静默全败）；`default_watchlist` 复制循环抽 `_collect`；`detect()` 复用 `_to_float`；AlertType label 映射收敛为 `_ALERT_REASON_LABEL` 单一来源；订阅上限 `MAX_HOT_SUBSCRIBE=100`、涨跌停阈值 `LIMIT_TRIGGER_PCT/LIMIT_FULL_PCT` 具名化；tdx_client `batch_snapshot`/`batch_fund_flow` 抽 `_batch_run`、`_check_tdx_process_alive` 改用 `TDX_EXE_NAME` 常量、`_TDX_HOME` 冗余别名收敛；stock_dashboard 删 `_commit_snapshot` 死包装器与不可达 return、清陈旧注释、`YI=1e8` 常量化、`TDX_NOFLOW_*` 常量归位、`dtime` 导入上移、删三处未使用 typing/sys import。高风险区（monkey-patch、sys.argv run_mode、并发时序、print/logger）按方案不动。验证：py_compile ×3 通过、前端 JS 语法检查通过、元素 ID 完整性通过。 |
 
 ---
 

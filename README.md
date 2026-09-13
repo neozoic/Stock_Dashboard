@@ -25,6 +25,9 @@ Stock_Dashboard/
 ├── .env.example                # 环境变量示例
 ├── README.md                   # 本文件
 ├── logs/                       # stdout/stderr 日志输出
+├── tools/
+│   ├── dashboard_watchdog.py   # 看板 watchdog（权威版；.hermes 副本为 wrapper）
+│   └── auto_sync.py 等          # 目录变动自动同步 GitHub/Gitee
 └── archive/
     └── stock_dashboard_tdx.py  # 旧版主程序（已停用，仅作历史参考）
 ```
@@ -77,6 +80,7 @@ python stock_dashboard.py
 | `DASHBOARD_BIND` | `0.0.0.0` | 绑定地址；容器化时改 `127.0.0.1` |
 | `DASHBOARD_KEEP_PROXY` | `0` | `1`=保留系统代理；默认会清掉代理环境变量 |
 | `STOCK_FLOW_FEISHU_WEBHOOK` | （空） | 飞书机器人 webhook；不填则异动仅输出 stdout |
+| `TDX_SEND_WARN` | `1` | 异动信号回推通达信 TQ 策略信号窗口（tq.send_warn）；`0`=关闭 |
 
 修改 `.env.example` 或在 `start_dashboard.bat` 中调整默认值。
 
@@ -90,6 +94,8 @@ python stock_dashboard.py
 | `/api/trend` | GET | 趋势数据：`timestamps`、`stock`、`industry`、`concept`、`market` |
 | `/api/history` | GET | 全部历史（仅开发用） |
 | `/api/alerts` | GET | 实时异动监测状态 |
+| `/api/minute?code=600519.SH&period=1m&count=N` | GET | 单股/板块 K线分时（TDX 本地数据；无数据返回空数组，TDX 不可用 503）|
+| `/api/indicator?code=600519.SH&formula=KDJ&arg=9,3,3` | GET | 内置公式指标（MA/KDJ/MACD/BOLL/VOL/RSI/WR/DMA/ASI；白名单外 400，TDX 不可用 503）|
 
 ## 数据源策略
 
@@ -168,10 +174,9 @@ schtasks /delete /tn "Stock_Dashboard_AutoSync"  :: 取消注册
 ## 迁移历史
 
 - 2026-08-08：从 `C:\Users\openclaw\` 根目录接管，迁入当前目录。
-- 旧 watchdog（`C:\Users\openclaw\.hermes\scripts\dashboard_watchdog.py` 与
-  `C:\Users\openclaw\.hermes\skills\productivity\stock-dashboard-frontend\scripts\dashboard_watchdog.py`）
-  仍硬编码守护 `C:\Users\openclaw\stock_dashboard_tdx.py`（已归档到 `archive/`），
-  路径已漂移。**用户后续决定**：保留（指向新路径）/ 重写 / 弃用。
+- 2026-09-05：watchdog 已重写解决路径漂移——权威版为 `tools/dashboard_watchdog.py`
+  （路径自定位，env 对齐 `start_dashboard.bat`），`.hermes` 下两份旧副本改为
+  thin wrapper 转发调用，hermes cron 注册无需变更。
 
 ## 不在本项目内
 

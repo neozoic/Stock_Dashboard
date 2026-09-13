@@ -6,6 +6,7 @@
 - 回调触发后主动 get_more_info 拿资金流
 - 检测异动（主力大额流入、涨跌停、涨幅突变）
 - 通过飞书 webhook 推送（如果配了）或 stdout 输出
+- 同时通过 tq.send_warn 回推到通达信 TQ 策略信号窗口（TDX_SEND_WARN=0 可关闭）
 
 集成方式：
 - 由 stock_dashboard.py 在后台线程启动
@@ -18,7 +19,6 @@
 """
 
 import os
-import sys
 import time
 import json
 import logging
@@ -36,6 +36,17 @@ if not FEISHU_WEBHOOK:
         "飞书 Webhook 未配置（环境变量 STOCK_FLOW_FEISHU_WEBHOOK 为空）。"
         "异动推送将只输出到 stdout，不会发送到飞书。"
     )
+
+# === 通达信 TQ 信号窗口回推（tq.send_warn）===
+# 默认开启；设 TDX_SEND_WARN=0 关闭。推送失败只记日志，绝不影响异动监测主流程。
+TDX_SEND_WARN = os.environ.get("TDX_SEND_WARN", "1").strip() != "0"
+
+# 实时订阅（hot）上限 — tq.subscribe_hq 单连接订阅数上限
+MAX_HOT_SUBSCRIBE = 100
+
+# 涨跌停检测：zaf 绝对值 ≥ LIMIT_TRIGGER_PCT 视为触及涨跌停，记录阈值 ±LIMIT_FULL_PCT
+LIMIT_TRIGGER_PCT = 9.9
+LIMIT_FULL_PCT = 10.0
 
 
 # ============================================================
@@ -73,23 +84,9 @@ class Alert:
         bj_now = datetime.now(timezone(td(hours=8))).replace(tzinfo=None)
         ts = bj_now.strftime("%H:%M:%S")
 
-        type_emoji = {
-            AlertType.BIG_INFLOW: "[IN]",
-            AlertType.BIG_OUTFLOW: "[OUT]",
-            AlertType.LIMIT_UP: "[UP]",
-            AlertType.LIMIT_DOWN: "[DOWN]",
-            AlertType.PRICE_JUMP: "[JUMP]",
-            AlertType.TURNOVER_SPIKE: "[VOL]",
-        }.get(self.alert_type, "[?]")
+        type_emoji = _ALERT_TYPE_EMOJI.get(self.alert_type, "[?]")
 
-        type_label = {
-            AlertType.BIG_INFLOW: "主力大额流入",
-            AlertType.BIG_OUTFLOW: "主力大额流出",
-            AlertType.LIMIT_UP: "触及涨停",
-            AlertType.LIMIT_DOWN: "触及跌停",
-            AlertType.PRICE_JUMP: "价格异动",
-            AlertType.TURNOVER_SPIKE: "成交量异动",
-        }.get(self.alert_type, self.alert_type)
+        type_label = _ALERT_REASON_LABEL.get(self.alert_type, self.alert_type)
 
         zjl_yi = self.current_zjl / 1e8
         direction = "净流入" if self.current_zjl >= 0 else "净流出"
@@ -165,25 +162,9 @@ class AlertDetector:
         """检测异动，返回 Alert 列表"""
         alerts = []
 
-        zjl = info.get('Zjl') or 0
-        # Zjl 可能是字符串 ('0.00') —— 强制转 float
-        if isinstance(zjl, str):
-            try:
-                zjl = float(zjl)
-            except (ValueError, TypeError):
-                zjl = 0
-        zaf = info.get('ZAF') or 0
-        if isinstance(zaf, str):
-            try:
-                zaf = float(zaf)
-            except (ValueError, TypeError):
-                zaf = 0
-        now_price = info.get('Now') or 0
-        if isinstance(now_price, str):
-            try:
-                now_price = float(now_price)
-            except (ValueError, TypeError):
-                now_price = 0
+        zjl = _to_float(info.get('Zjl'))
+        zaf = _to_float(info.get('ZAF'))
+        now_price = _to_float(info.get('Now'))
 
         # 1. 主力大额流入/流出
         if zjl >= self.big_inflow_yi * 1e8:
@@ -200,10 +181,10 @@ class AlertDetector:
             ))
 
         # 2. 涨跌停（zaf 接近 ±10%）
-        if self.limit_up_trigger and zaf >= 9.9:
-            alerts.append(Alert(code, name, AlertType.LIMIT_UP, zjl, zaf, 10.0))
-        if self.limit_down_trigger and zaf <= -9.9:
-            alerts.append(Alert(code, name, AlertType.LIMIT_DOWN, zjl, zaf, -10.0))
+        if self.limit_up_trigger and zaf >= LIMIT_TRIGGER_PCT:
+            alerts.append(Alert(code, name, AlertType.LIMIT_UP, zjl, zaf, LIMIT_FULL_PCT))
+        if self.limit_down_trigger and zaf <= -LIMIT_TRIGGER_PCT:
+            alerts.append(Alert(code, name, AlertType.LIMIT_DOWN, zjl, zaf, -LIMIT_FULL_PCT))
 
         # 3. 价格异动（和上次比）
         with self._lock:
@@ -251,6 +232,75 @@ def send_feishu_text(text: str):
 
 
 # ============================================================
+# 通达信 TQ 信号窗口回推（tq.send_warn）
+# ============================================================
+
+def _to_float(v, default: float = 0.0) -> float:
+    try:
+        return float(v)
+    except (TypeError, ValueError):
+        return default
+
+
+# bs_flag 映射：0=买(红B), 1=卖(绿S), 2=未知(黄双叠三角)
+# 涨停/大单流入=0，跌停=1，其他=2
+_ALERT_BS_FLAG = {
+    AlertType.LIMIT_UP: 0,
+    AlertType.BIG_INFLOW: 0,
+    AlertType.LIMIT_DOWN: 1,
+}
+
+_ALERT_TYPE_EMOJI = {
+    AlertType.BIG_INFLOW: "[IN]",
+    AlertType.BIG_OUTFLOW: "[OUT]",
+    AlertType.LIMIT_UP: "[UP]",
+    AlertType.LIMIT_DOWN: "[DOWN]",
+    AlertType.PRICE_JUMP: "[JUMP]",
+    AlertType.TURNOVER_SPIKE: "[VOL]",
+}
+
+_ALERT_REASON_LABEL = {
+    AlertType.BIG_INFLOW: "主力大额流入",
+    AlertType.BIG_OUTFLOW: "主力大额流出",
+    AlertType.LIMIT_UP: "触及涨停",
+    AlertType.LIMIT_DOWN: "触及跌停",
+    AlertType.PRICE_JUMP: "价格异动",
+    AlertType.TURNOVER_SPIKE: "成交量异动",
+}
+
+
+def send_warn_to_tdx(alert: 'Alert', info: Optional[Dict] = None) -> bool:
+    """把异动信号推回通达信 TQ 策略信号窗口（tq.send_warn）。
+
+    - 受环境变量 TDX_SEND_WARN 控制（默认 1 开，0 关）
+    - 走 tdx_client.send_warn_signals（内部 _call_with_timeout 8s 超时）
+    - 任何失败/异常都静默处理（只记 debug 日志），绝不影响异动监测主流程
+
+    Returns:
+        True=推送成功；False=关闭/失败
+    """
+    if not TDX_SEND_WARN:
+        return False
+    try:
+        import tdx_client
+        from datetime import timezone, timedelta as _td
+        info = info or {}
+        price = _to_float(info.get("Now"))
+        ts = datetime.now(timezone(_td(hours=8))).strftime("%Y%m%d%H%M%S")
+        reason = _ALERT_REASON_LABEL.get(alert.alert_type, str(alert.alert_type))
+        bs_flag = _ALERT_BS_FLAG.get(alert.alert_type, 2)
+        ok = tdx_client.send_warn_signals(
+            [alert.code], [ts], [price], [bs_flag], [price], [reason],
+        )
+        if not ok:
+            logger.debug("send_warn 未推送: %s %s", alert.code, alert.alert_type)
+        return ok
+    except Exception as e:
+        logger.debug("send_warn 异常（已忽略）: %s", e)
+        return False
+
+
+# ============================================================
 # 实时监测主循环
 # ============================================================
 
@@ -295,6 +345,7 @@ class RealtimeAlertMonitor:
         # 统计
         self.stats = {
             'alerts_sent': 0,
+            'warn_sent': 0,          # send_warn 回推成功数
             'events_received': 0,   # 订阅推送
             'scans_done': 0,         # 兜底扫描次数
             'started_at': None,
@@ -324,9 +375,9 @@ class RealtimeAlertMonitor:
                 _sys.argv = [_sys.argv[0]] + ['--run_tdx', str(try_mode)]
                 try:
                     # 复用 tdx_client 的路径常量（TDX_HOME / TDX_EXE_NAME 环境变量化）
-                    from tdx_client import TDX_EXE, _TDX_DLL
+                    from tdx_client import _TDX_EXE, _TDX_DLL
                     self._tq.initialize(
-                        TDX_EXE,
+                        _TDX_EXE,
                         dll_path=_TDX_DLL,
                     )
                     self._initialized = True
@@ -359,9 +410,9 @@ class RealtimeAlertMonitor:
 
             # 决定 hot 列表
             if hot_codes is None:
-                hot_codes = list(codes)[:100]
+                hot_codes = list(codes)[:MAX_HOT_SUBSCRIBE]
             else:
-                hot_codes = hot_codes[:100]
+                hot_codes = hot_codes[:MAX_HOT_SUBSCRIBE]
             self._hot_watchlist = set(hot_codes)
 
         logger.info("设置候选池: 全集 %d 只, 实时订阅 %d 只",
@@ -391,9 +442,9 @@ class RealtimeAlertMonitor:
 
         if not codes:
             return
-        if len(codes) > 100:
+        if len(codes) > MAX_HOT_SUBSCRIBE:
             logger.warning("订阅数 %d 超过 100，截断", len(codes))
-            codes = codes[:100]
+            codes = codes[:MAX_HOT_SUBSCRIBE]
 
         def on_data(datas):
             try:
@@ -525,6 +576,8 @@ class RealtimeAlertMonitor:
                         msg = alert.to_markdown()
                         logger.info("异动(扫描): %s %s", code, alert.alert_type)
                         send_feishu_text(msg)
+                        if send_warn_to_tdx(alert, info):
+                            self.stats['warn_sent'] += 1
                         self.stats['alerts_sent'] += 1
             logger.debug("扫描进度: %d/%d", min(i + self.scan_chunk_size, len(to_scan)), len(to_scan))
 
@@ -543,6 +596,8 @@ class RealtimeAlertMonitor:
                     msg = alert.to_markdown()
                     logger.info("异动: %s %s", code, alert.alert_type)
                     send_feishu_text(msg)
+                    if send_warn_to_tdx(alert, info):
+                        self.stats['warn_sent'] += 1
                     self.stats['alerts_sent'] += 1
         except Exception as e:
             logger.debug("_handle_update(%s) 失败: %s", code, e)
@@ -563,12 +618,11 @@ def default_watchlist(monitor_instance: 'RealtimeAlertMonitor'):
       - 然后用 stock_dashboard 的 fetch_once 算出当日 TOP 100，更新 hot
     """
     import tdx_client
-    normal_codes = []
-    names = {}
-    try:
-        # 直接用已初始化的 tqcenter（不调 init，避免占槽位）
-        from tqcenter import tq as _tq
-        sl = _tq.get_stock_list(market='5', list_type=1) or []
+
+    def _collect(sl):
+        """过滤 ST/退 + 校验 .SH/.SZ 后缀，返回 (codes, names)。"""
+        codes = []
+        names = {}
         for s in sl:
             code = s.get('Code', '')
             name = (s.get('Name', '') or '').strip()
@@ -576,11 +630,18 @@ def default_watchlist(monitor_instance: 'RealtimeAlertMonitor'):
                 continue
             if not code.endswith(('.SH', '.SZ')):
                 continue
-            normal_codes.append(code)
+            codes.append(code)
             names[code] = name
+        return codes, names
+
+    try:
+        # 直接用已初始化的 tqcenter（不调 init，避免占槽位）
+        from tqcenter import tq as _tq
+        sl = _tq.get_stock_list(market='5', list_type=1) or []
+        normal_codes, names = _collect(sl)
         logger.info("非 ST A 股候选池: %d 只 (via _tq.get_stock_list)", len(normal_codes))
         if normal_codes:
-            hot = sorted(normal_codes)[:100]
+            hot = sorted(normal_codes)[:MAX_HOT_SUBSCRIBE]
             monitor_instance.set_watchlist(normal_codes, names=names, hot_codes=hot)
             return
     except Exception as e:
@@ -589,17 +650,9 @@ def default_watchlist(monitor_instance: 'RealtimeAlertMonitor'):
     try:
         tdx_client.init()
         sl = tdx_client.get_a_share_list()
-        for s in sl:
-            code = s['Code']
-            name = s.get('Name', '').strip()
-            if 'ST' in name.upper() or '退' in name:
-                continue
-            if not code.endswith(('.SH', '.SZ')):
-                continue
-            normal_codes.append(code)
-            names[code] = name
+        normal_codes, names = _collect(sl)
         logger.info("非 ST A 股候选池: %d 只 (via tdx_client)", len(normal_codes))
-        hot = sorted(normal_codes)[:100]
+        hot = sorted(normal_codes)[:MAX_HOT_SUBSCRIBE]
         monitor_instance.set_watchlist(normal_codes, names=names, hot_codes=hot)
     except Exception as e:
         logger.exception("default_watchlist 失败: %s", e)

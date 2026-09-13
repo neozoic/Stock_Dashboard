@@ -21,9 +21,10 @@ A 股资金流实时看板 - 后端 (通达信 TdxQuant 数据源)
 时区:
 - 本机系统时区不是北京时间 (如 UTC-7 Mountain Time)
 - 所有时间相关逻辑（in_trading_hours / timestamp / 趋势时间戳）统一用北京时间
-- 通过 _BJ_NOW() 获取北京时间
+- 通过 bj_now() 获取北京时间
 """
 import os
+import sys
 # 默认行为：强制清代理环境变量，避免公司/系统代理干扰 TDX 与 akshare 数据源。
 # 若新机器需要保留代理（如企业代理访问 akshare），可在启动前设置：
 #   set DASHBOARD_KEEP_PROXY=1
@@ -34,14 +35,15 @@ if os.environ.get("DASHBOARD_KEEP_PROXY") != "1":
     os.environ["no_proxy"] = "*"
 
 import json
+import re
 import time
+import socket
 import threading
 import logging
 import warnings
 from http.server import BaseHTTPRequestHandler, HTTPServer
 from socketserver import ThreadingMixIn
-from datetime import datetime, timezone, timedelta
-from typing import Dict, List
+from datetime import datetime, timezone, timedelta, time as dtime
 
 warnings.filterwarnings("ignore")
 logging.basicConfig(
@@ -96,7 +98,6 @@ def _call_with_timeout(func, *args, timeout=None, default=None, label=""):
         logger.debug("%s 异常: %s", label or func.__name__, box["error"])
         return default
     return box.get("value")
-    return datetime.now(BJ_TZ)
 
 
 def bj_now_naive() -> datetime:
@@ -145,10 +146,6 @@ except Exception:
     AK_OK = False
 
 
-# 演示数据：6 个交易日的 TOP10 流入/流出快照（真实股票 + 合理金额）。
-# 真实运行后会被 daily_snapshot_loop 的每日保存覆盖；这里仅用于让前端一启动就能看到效果。
-
-# 当日（8 月 8 日）个股 TOP10 流入/流出
 DATA_LOCK = threading.Lock()
 FETCH_LOCK = threading.Lock()
 LATEST = {
@@ -192,11 +189,29 @@ DEFAULT_FETCH_CONCEPT_TOP_N = 15
 DEFAULT_FETCH_INDUSTRY_BOTTOM_N = 10
 DEFAULT_FETCH_CONCEPT_BOTTOM_N = 8
 
+# 元 → 亿 换算
+YI = 1e8
+
+# TDX 资金流全 0 的粘性跳过：level-1 客户端 TQ 不下发资金流分类数据时，
+# 每轮 ~90s+ 的全 A 股 TDX 拉取纯属浪费，还会顶爆 175s watchdog 导致
+# 每轮强制重建连接。连续 TDX_NOFLOW_STREAK 轮全 0 后跳过 TDX 主拉
+# （直接走 akshare，一轮 ~30s），每 TDX_NOFLOW_RETRY_SECONDS 再试一次，
+# 以便 TQ 恢复下发后自动切回 mixed 模式。
+TDX_NOFLOW_STREAK = 2
+TDX_NOFLOW_RETRY_SECONDS = 900
+_TDX_NOFLOW = {"streak": 0, "skip_until": 0.0}
+
 # 概念板块代码前缀（通达信 8809xx 系列）
 CONCEPT_PREFIXES = ("8809",)
 
 # 申万行业代码前缀（通达信 881xxx 系列，6 位数字）
 INDUSTRY_PREFIXES = ("881",)
+
+# /api/minute 与 /api/indicator 的参数白名单/校验
+MINUTE_PERIODS = ("1m", "5m", "15m", "30m", "1h", "1d", "1w", "1mon")
+INDICATOR_FORMULAS = ("MA", "KDJ", "MACD", "BOLL", "VOL", "RSI", "WR", "DMA", "ASI")
+_CODE_PATTERN = re.compile(r"^[0-9A-Za-z]{4,10}\.(SH|SZ|BJ)$")
+_FORMULA_ARG_PATTERN = re.compile(r"^[0-9,.\-]{0,40}$")
 
 
 def in_trading_hours(now=None):
@@ -204,7 +219,6 @@ def in_trading_hours(now=None):
     if now.weekday() > 4:
         return False
     t = now.time()
-    from datetime import time as dtime
     return (dtime(9, 30) <= t <= dtime(11, 30)) or (dtime(13, 0) <= t <= dtime(15, 0))
 
 
@@ -217,7 +231,7 @@ def _format_stock_row(code, name, fund_flow_dict, snapshot_dict=None):
     zaf = fund_flow_dict.get("ZAF") or 0
     # 净额：主力净流入，单位元 → 转亿
     zjl = fund_flow_dict.get("Zjl") or 0
-    zjl_yi = zjl / 1e8  # 元 → 亿
+    zjl_yi = zjl / YI  # 元 → 亿
     return {
         "股票代码": code,
         "股票简称": name or "",
@@ -386,8 +400,8 @@ def fetch_sector_aggregate_tdx(prefix_filter=None, top_n=15, max_sectors=80):
             rows.append({
                 "行业": sec["Name"],
                 "行业-涨跌幅": round(avg_zaf, 2),
-                "净额": f"{total_zjl / 1e8:.2f}亿",
-                "_主力净流入_亿": round(total_zjl / 1e8, 4),
+                "净额": f"{total_zjl / YI:.2f}亿",
+                "_主力净流入_亿": round(total_zjl / YI, 4),
                 "_成分股数": len(codes),
             })
 
@@ -438,6 +452,80 @@ def sort_by_money(df, col, ascending=False):
     ).drop(columns=["_sort"]).reset_index(drop=True)
 
 
+# 同花顺个股资金流页面列名（按位置截取）。
+# akshare 官方 stock_fund_flow_individual 对列数写死，10jqka 偶有脏页
+# （列数不同的表）混进 concat 就会 ValueError: Length mismatch，
+# 因此这里自己分页拉取，逐页校验列数、跳过脏页。
+_THS_INDIVIDUAL_COLS = ["序号", "股票代码", "股票简称", "最新价", "涨跌幅",
+                        "换手率", "流入资金", "流出资金", "净额", "成交额"]
+_THS_PERIOD_COLS = ["序号", "股票代码", "股票简称", "最新价", "阶段涨跌幅",
+                    "连续换手率", "资金流入净额"]
+
+
+def _ths_signed_headers():
+    """生成同花顺 hexin-v 签名请求头（复用 akshare 内置 ths.js）。"""
+    from akshare.stock_feature.stock_fund_flow import _get_file_content_ths, py_mini_racer
+    js = py_mini_racer.MiniRacer()
+    js.eval(_get_file_content_ths("ths.js"))
+    return {
+        "Accept": "text/html, */*; q=0.01",
+        "hexin-v": js.call("v"),
+        "Host": "data.10jqka.com.cn",
+        "Referer": "http://data.10jqka.com.cn/funds/hyzjl/",
+        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
+                      "Chrome/90.0.4430.85 Safari/537.36",
+        "X-Requested-With": "XMLHttpRequest",
+    }
+
+
+def fetch_ths_fund_flow_individual(symbol="即时"):
+    """同花顺个股资金流排行（列数宽容版，替代 ak.stock_fund_flow_individual）。
+
+    symbol: "即时" / "3日排行" / "5日排行" / "10日排行" / "20日排行"。
+    返回 DataFrame；全部页面失败时抛异常（由调用方记入 *_error）。
+    """
+    import requests
+    import pandas as pd
+    from io import StringIO
+    from bs4 import BeautifulSoup
+
+    if symbol == "即时":
+        page_url = "http://data.10jqka.com.cn/funds/ggzjl/field/zdf/order/desc/page/{}/ajax/1/free/1/"
+        col_names = _THS_INDIVIDUAL_COLS
+    else:
+        board = {"3日排行": 3, "5日排行": 5, "10日排行": 10, "20日排行": 20}.get(symbol)
+        if board is None:
+            raise ValueError(f"未知 symbol: {symbol}")
+        page_url = f"http://data.10jqka.com.cn/funds/ggzjl/board/{board}/field/zdf/order/desc/page/{{}}/ajax/1/free/1/"
+        col_names = _THS_PERIOD_COLS
+
+    r = requests.get("http://data.10jqka.com.cn/funds/ggzjl/field/code/order/desc/ajax/1/free/1/",
+                     headers=_ths_signed_headers(), timeout=15)
+    soup = BeautifulSoup(r.text, features="lxml")
+    page_num = int(soup.find(name="span", attrs={"class": "page_info"}).text.split("/")[1])
+
+    frames = []
+    bad_pages = 0
+    for page in range(1, page_num + 1):
+        try:
+            r = requests.get(page_url.format(page), headers=_ths_signed_headers(), timeout=15)
+            dfs = pd.read_html(StringIO(r.text))
+        except Exception:
+            bad_pages += 1
+            continue
+        if not dfs or dfs[0].empty or dfs[0].shape[1] < len(col_names):
+            bad_pages += 1
+            continue
+        frames.append(dfs[0].iloc[:, :len(col_names)])
+    if bad_pages:
+        logger.warning("同花顺个股资金流(%s)：跳过 %d/%d 个脏页", symbol, bad_pages, page_num)
+    if not frames:
+        raise RuntimeError(f"同花顺个股资金流({symbol})：{page_num} 个页面全部拉取失败")
+    big_df = pd.concat(frames, ignore_index=True)
+    big_df.columns = col_names
+    return big_df.drop(columns=["序号"])
+
+
 def fetch_akshare_fallback():
     """通达信失败时用 akshare 兜底"""
     if not AK_OK:
@@ -449,7 +537,7 @@ def fetch_akshare_fallback():
         "source": "akshare",
     }
     try:
-        df = ak.stock_fund_flow_individual(symbol="即时")
+        df = fetch_ths_fund_flow_individual("即时")
         if df is not None and not df.empty:
             df = df.drop_duplicates(subset=["股票代码"], keep="first")
             top = sort_by_money(df, "净额", ascending=False).head(20)
@@ -469,6 +557,19 @@ def fetch_akshare_fallback():
             snap["industry_bottom"] = bot.fillna("").to_dict(orient="records")
     except Exception as e:
         snap["industry_error"] = str(e)
+
+    try:
+        df = ak.stock_fund_flow_concept(symbol="即时")
+        if df is not None and not df.empty:
+            df = df.drop_duplicates(subset=["行业"], keep="first")
+            top = sort_by_money(df, "净额", ascending=False).head(15)
+            bot = sort_by_money(df, "净额", ascending=True).head(5)
+            snap["concept_top"] = top.fillna("").to_dict(orient="records")
+            snap["concept_bottom"] = bot.fillna("").to_dict(orient="records")
+    except Exception as e:
+        snap["concept_error"] = str(e)
+
+    return snap
 
 
 # 近 N 日累计资金流排行（akshare 同花顺源）
@@ -491,11 +592,11 @@ def fetch_akshare_period(period: str):
         return None
     out = {"period": period, "source": "akshare", "stock_top": [], "stock_bottom": [], "error": None}
     try:
-        df = ak.stock_fund_flow_individual(symbol=sym)
+        df = fetch_ths_fund_flow_individual(sym)
         if df is not None and not df.empty:
             df = df.drop_duplicates(subset=["股票代码"], keep="first")
-            top = sort_by_money(df, "净额", ascending=False).head(20)
-            bot = sort_by_money(df, "净额", ascending=True).head(10)
+            top = sort_by_money(df, "资金流入净额", ascending=False).head(20)
+            bot = sort_by_money(df, "资金流入净额", ascending=True).head(10)
             out["stock_top"] = top.fillna("").to_dict(orient="records")
             out["stock_bottom"] = bot.fillna("").to_dict(orient="records")
     except Exception as e:
@@ -559,19 +660,6 @@ def build_period_compare():
         "top_inflow_5d": period_cache.get("5d", {}).get("stock_top", [])[:10],
         "top_outflow_5d": period_cache.get("5d", {}).get("stock_bottom", [])[:10],
     }
-
-    try:
-        df = ak.stock_fund_flow_concept(symbol="即时")
-        if df is not None and not df.empty:
-            df = df.drop_duplicates(subset=["行业"], keep="first")
-            top = sort_by_money(df, "净额", ascending=False).head(15)
-            bot = sort_by_money(df, "净额", ascending=True).head(5)
-            snap["concept_top"] = top.fillna("").to_dict(orient="records")
-            snap["concept_bottom"] = bot.fillna("").to_dict(orient="records")
-    except Exception as e:
-        snap["concept_error"] = str(e)
-
-    return snap
 
 
 # ============================================================
@@ -709,7 +797,7 @@ def _fetch_via_tdx(now):
         # 探测：tdx 跑通但所有净额都是 0 → fallback 到 akshare
         if not (_has_real_money(stock_top) or _has_real_money(ind_top) or _has_real_money(con_top)):
             logger.warning(
-                "tdx 资金流全 0（TQ server 没给资金流分类数据，可能是 level-1 客户端或午盘累积中），fallback 到 akshare"
+                "tdx 资金流全 0（TQ server 未下发资金流分类数据，level-1 客户端常见），fallback 到 akshare"
             )
             tdx_no_fund_flow = True
         return snapshot, True, tdx_no_fund_flow
@@ -747,9 +835,6 @@ def _compose_snapshot(now, tdx_no_fund_flow):
         "error": None,
         "source": "tdx",
     }
-
-
-# _append_history 已被 _commit_snapshot_and_history 取代（P3-1 原子提交）。
 
 
 def _commit_snapshot_and_history(snapshot):
@@ -803,14 +888,6 @@ def _commit_snapshot_and_history(snapshot):
     return True
 
 
-def _commit_snapshot(snapshot):
-    """阶段 4 兼容入口（仅写 LATEST 不写 history，保留以兼容旧调用）。
-
-    推荐使用 _commit_snapshot_and_history() 同时完成 history + LATEST。
-    """
-    return _commit_snapshot_and_history(snapshot)
-
-
 def fetch_once():
     """拉一次完整数据，存到 LATEST（线程安全）。
 
@@ -822,8 +899,24 @@ def fetch_once():
         now = bj_now_naive()
         snapshot = _compose_snapshot(now, False)
 
-        # === 阶段 1：TDX 主路径 ===
-        tdx_snap, tdx_used, tdx_no_fund_flow = _fetch_via_tdx(now)
+        # === 阶段 1：TDX 主路径（资金流持续全 0 时粘性跳过）===
+        skip_left = _TDX_NOFLOW["skip_until"] - time.time()
+        if TDX_OK and skip_left > 0:
+            logger.info("[bg] TDX 资金流持续全 0，本轮跳过 TDX 主拉（%ds 后重试）", int(skip_left))
+            tdx_snap, tdx_used, tdx_no_fund_flow = {}, False, False
+        else:
+            tdx_snap, tdx_used, tdx_no_fund_flow = _fetch_via_tdx(now)
+            if tdx_used and tdx_no_fund_flow:
+                _TDX_NOFLOW["streak"] += 1
+                if _TDX_NOFLOW["streak"] >= TDX_NOFLOW_STREAK:
+                    _TDX_NOFLOW["skip_until"] = time.time() + TDX_NOFLOW_RETRY_SECONDS
+                    logger.warning(
+                        "[bg] TDX 资金流连续 %d 轮全 0，%ds 内跳过 TDX 主拉（akshare 兜底）",
+                        _TDX_NOFLOW["streak"], TDX_NOFLOW_RETRY_SECONDS,
+                    )
+            elif tdx_used:
+                _TDX_NOFLOW["streak"] = 0
+                _TDX_NOFLOW["skip_until"] = 0.0
         snapshot.update(tdx_snap)
         # === 阶段 1.5：akshare 兜底（TDX 失败 / TDX 资金流全 0）===
         if not tdx_used or tdx_no_fund_flow:
@@ -840,15 +933,30 @@ def fetch_once():
 def background_loop(interval=60, stop_event=None):
     """后台线程：每 interval 秒拉一次（通达信比 akshare 慢，间隔拉长到 60s）
 
-"""
+    hang 恢复策略：fetch_once 整轮超时后，下一轮前强制 init(force=True)
+    重建 TDX 连接——否则一次 hang 会让旧连接一直僵死到下次定时重连。
+    """
     print(f"[bg] started, interval={interval}s, source={'tdx' if TDX_OK else 'akshare'}", flush=True)
     if stop_event is None:
         stop_event = threading.Event()
+    # 超时可辨识哨兵：fetch_once 正常返回也是 None，
+    # 用 default=None 会把每一轮都误判为超时（历史上"连续 N 轮超时"全为此假阳性）
+    fetch_timeout = object()
+    consecutive_timeouts = 0
     while not stop_event.is_set():
+        if consecutive_timeouts > 0 and TDX_OK:
+            # 上一轮 hang 过：旧连接可能已僵死，强制重连（init 本身也包超时，防止卡在这里）
+            logger.warning("[bg] 连续 %d 轮超时，强制重建 TDX 连接", consecutive_timeouts)
+            ok = _call_with_timeout(lambda: tdx_client.init(force=True), timeout=30, default=False,
+                                    label="background_loop.init(force=True)")
+            logger.warning("[bg] TDX 强制重连%s", "成功" if ok else "失败")
         # 整轮 watchdog：fetch_once 在 daemon 线程里跑，超时则放弃本轮（保留 LATEST 旧值）
-        watchdog = _call_with_timeout(fetch_once, timeout=interval - 5, default=None, label="background_loop.fetch_once")
-        if watchdog is None:
-            logger.warning("[bg] 本轮拉数超过 %ds watchdog 超时", interval - 5)
+        watchdog = _call_with_timeout(fetch_once, timeout=interval - 5, default=fetch_timeout, label="background_loop.fetch_once")
+        if watchdog is fetch_timeout:
+            consecutive_timeouts += 1
+            logger.warning("[bg] 本轮拉数超过 %ds watchdog 超时（连续 %d 轮）", interval - 5, consecutive_timeouts)
+        else:
+            consecutive_timeouts = 0
         # 间隔睡眠，但能被 stop_event 立即唤醒
         if stop_event.wait(timeout=interval):
             break
@@ -1024,6 +1132,10 @@ class Handler(BaseHTTPRequestHandler):
             self._serve_health()
         elif self.path == "/api/alerts":
             self._serve_alerts()
+        elif self.path.startswith("/api/minute"):
+            self._serve_minute()
+        elif self.path.startswith("/api/indicator"):
+            self._serve_indicator()
         elif self.path.startswith("/api/data/period_compare"):
             self._serve_period_compare()
         elif self.path.startswith("/api/data/daily_top"):
@@ -1066,6 +1178,117 @@ class Handler(BaseHTTPRequestHandler):
         with DATA_LOCK:
             payload = dict(LATEST["period"].get(period, {}))
         self._send_json_response(200, {"period": period, **payload})
+
+    def _serve_minute(self):
+        """GET /api/minute?code=600519.SH&period=1m&count=240 — 单股/板块 K线/分时数据。
+
+        数据源是通达信本地已下载数据（tq.get_market_data）：
+        - 盘后/未下载时返回 200 + 空 data.timestamps（属正常情况）
+        - TDX 不可用/超时返回 503（不会 hang，tdx_client 内部已包超时）
+        """
+        from urllib.parse import urlparse, parse_qs
+        qs = parse_qs(urlparse(self.path).query)
+        code = (qs.get("code", [""])[0] or "").strip().upper()
+        period = (qs.get("period", ["1m"])[0] or "1m").strip().lower()
+        if not code or not _CODE_PATTERN.match(code):
+            self._send_json_response(400, {"ok": False, "code": 400, "error": "invalid_code",
+                                           "message": "code 需形如 600519.SH / 000001.SZ / 880952.SH"})
+            return
+        if period not in MINUTE_PERIODS:
+            self._send_json_response(400, {"ok": False, "code": 400, "error": "invalid_period",
+                                           "message": f"period 仅支持 {list(MINUTE_PERIODS)}"})
+            return
+        count = None
+        raw_count = (qs.get("count", [""])[0] or "").strip()
+        if raw_count:
+            try:
+                count = max(1, min(int(raw_count), 2000))
+            except (ValueError, TypeError):
+                self._send_json_response(400, {"ok": False, "code": 400, "error": "invalid_count",
+                                               "message": "count 需为正整数"})
+                return
+        if not TDX_OK:
+            self._send_json_response(503, {"ok": False, "code": 503, "error": "tdx_unavailable",
+                                           "message": "tdx_client 不可用"})
+            return
+        try:
+            bars = tdx_client.get_minute_bars([code], period=period, count=count)
+        except Exception as e:
+            self._send_json_response(503, {"ok": False, "code": 503, "error": "tdx_error",
+                                           "message": f"get_minute_bars 异常: {e}"})
+            return
+        if bars is None:
+            self._send_json_response(503, {"ok": False, "code": 503, "error": "tdx_unavailable",
+                                           "message": "通达信 TQ 调用失败或超时"})
+            return
+        data = bars.get(code) or {"timestamps": []}
+        self._send_json_response(200, {
+            "ok": True,
+            "stock": code,
+            "period": period,
+            "count": len(data.get("timestamps", [])),
+            "data": data,
+        })
+
+    def _serve_indicator(self):
+        """GET /api/indicator?code=600519.SH&formula=KDJ&arg=9,3,3&period=1d&count=120 — 内置公式指标。
+
+        formula 白名单见 INDICATOR_FORMULAS（接口文档内置公式）；不在白名单返回 400。
+        TDX 不可用/超时返回 503（不会 hang，tdx_client 内部已包超时）。
+        """
+        from urllib.parse import urlparse, parse_qs
+        qs = parse_qs(urlparse(self.path).query)
+        code = (qs.get("code", [""])[0] or "").strip().upper()
+        formula = (qs.get("formula", [""])[0] or "").strip().upper()
+        arg = (qs.get("arg", [""])[0] or "").strip()
+        period = (qs.get("period", ["1d"])[0] or "1d").strip().lower()
+        if not code or not _CODE_PATTERN.match(code):
+            self._send_json_response(400, {"ok": False, "code": 400, "error": "invalid_code",
+                                           "message": "code 需形如 600519.SH / 000001.SZ"})
+            return
+        if formula not in INDICATOR_FORMULAS:
+            self._send_json_response(400, {"ok": False, "code": 400, "error": "invalid_formula",
+                                           "message": f"formula 仅支持 {list(INDICATOR_FORMULAS)}"})
+            return
+        if arg and not _FORMULA_ARG_PATTERN.match(arg):
+            self._send_json_response(400, {"ok": False, "code": 400, "error": "invalid_arg",
+                                           "message": "arg 仅允许数字、逗号、小数点、负号"})
+            return
+        if period not in MINUTE_PERIODS:
+            self._send_json_response(400, {"ok": False, "code": 400, "error": "invalid_period",
+                                           "message": f"period 仅支持 {list(MINUTE_PERIODS)}"})
+            return
+        try:
+            count = max(1, min(int((qs.get("count", ["120"])[0] or "120")), 1000))
+        except (ValueError, TypeError):
+            count = 120
+        if not TDX_OK:
+            self._send_json_response(503, {"ok": False, "code": 503, "error": "tdx_unavailable",
+                                           "message": "tdx_client 不可用"})
+            return
+        try:
+            result = tdx_client.get_formula_indicator(formula, arg, stock_code=code,
+                                                      period=period, count=count)
+        except ValueError as e:
+            self._send_json_response(400, {"ok": False, "code": 400, "error": "invalid_formula",
+                                           "message": str(e)})
+            return
+        except Exception as e:
+            self._send_json_response(503, {"ok": False, "code": 503, "error": "tdx_error",
+                                           "message": f"get_formula_indicator 异常: {e}"})
+            return
+        if result is None:
+            self._send_json_response(503, {"ok": False, "code": 503, "error": "tdx_unavailable",
+                                           "message": "通达信 TQ 调用失败或超时"})
+            return
+        self._send_json_response(200, {
+            "ok": True,
+            "stock": code,
+            "formula": formula,
+            "arg": arg,
+            "period": period,
+            "data": result,
+        })
 
     def _serve_period_compare(self):
         """GET /api/data/period_compare — 1d/3d/5d/10d 累计流入流出总额 + 近5日明细。"""
@@ -1281,6 +1504,7 @@ class Handler(BaseHTTPRequestHandler):
                 "hot_watchlist_size": len(m._hot_watchlist),
                 "subscribed_size": len(m._subscribed),
                 "alerts_sent": m.stats['alerts_sent'],
+                "warn_sent": m.stats.get('warn_sent', 0),
                 "events_received": m.stats['events_received'],
                 "scans_done": m.stats['scans_done'],
                 "started_at": m.stats['started_at'],
@@ -1296,11 +1520,29 @@ class Handler(BaseHTTPRequestHandler):
         self.wfile.write(data)
 
 
+def _is_port_in_use(port, host="127.0.0.1", timeout=1.5):
+    """端口已有监听则返回 True（用于启动前自检，避免 bind 报一串 traceback）"""
+    try:
+        with socket.create_connection((host, port), timeout=timeout):
+            return True
+    except (ConnectionRefusedError, socket.timeout, OSError):
+        return False
+
+
 def main(port=None, fetch_interval=180):
     # 端口 / 绑定可通过环境变量覆盖
     if port is None:
         port = int(os.environ.get("DASHBOARD_PORT", "8765"))
     bind_host = os.environ.get("DASHBOARD_BIND", "0.0.0.0")
+
+    # 启动前端口占用自检：占用时直接报错退出，提示如何清理残留进程
+    if _is_port_in_use(port):
+        print(f"[FAIL] 端口 {port} 已被占用，看板未启动。", flush=True)
+        print("  清理残留进程（PowerShell）:", flush=True)
+        print(f"  Get-NetTCPConnection -LocalPort {port} -State Listen | "
+              "ForEach-Object { Stop-Process -Id $_.OwningProcess -Force }", flush=True)
+        sys.exit(2)
+
     print(f"[{bj_now_naive():%H:%M:%S}] 启动 A 股资金流看板")
     print(f"  数据源: {'通达信 TdxQuant' if TDX_OK else 'akshare 兜底'}")
     print(f"  访问地址: http://localhost:{port}/")
