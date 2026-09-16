@@ -54,8 +54,13 @@ Stock_Dashboard/
 
 ```bat
 cd C:\Mac\Home\Desktop\win_WorkSpace_ClaudeCode\Stock_Dashboard
-start_dashboard.bat
+start_oneclick.bat
 ```
+
+一键启动脚本：后台拉起后端 → 等待 `/api/health` 就绪（最长 40 秒）→ 自动打开浏览器。
+已运行时会直接打开浏览器，不会重复启动。停止看板用 `stop_dashboard.bat`（按端口找到进程并结束）。
+
+也可以用旧的 `start_dashboard.bat`（前台运行，日志写入 `logs\`，窗口不能关）。
 
 启动成功后：
 
