@@ -35,6 +35,7 @@ TdxQuant 客户端包装模块
 from __future__ import annotations
 
 import os
+import re
 import sys
 import time
 import logging
@@ -47,6 +48,9 @@ from typing import Dict, List, Optional
 TDX_HOME = os.environ.get("TDX_HOME", r"C:\new_tdx64")
 TDX_PYPLUGINS = os.path.join(TDX_HOME, "PYPlugins")
 TDX_EXE_NAME = os.environ.get("TDX_EXE_NAME", "TdxW.exe")
+# 白名单校验：TDX_EXE_NAME 会被拼进 PowerShell 命令串，只允许字母/数字/_/.
+if not re.fullmatch(r"[\w.]+", TDX_EXE_NAME):
+    raise ValueError(f"TDX_EXE_NAME 含非法字符（仅允许 [\\w.]+）: {TDX_EXE_NAME!r}")
 _TDX_EXE = os.path.join(TDX_HOME, TDX_EXE_NAME)
 _TDX_DLL = os.path.join(TDX_PYPLUGINS, "TPythClient.dll")
 
@@ -59,7 +63,8 @@ _TDX_PROCESS_NAMES = (TDX_EXE_NAME,)
 if sys.platform == "win32":
     # 让 Windows 能找到兄弟 DLL（tdxrpc64.dll 等）
     for d in (TDX_HOME, TDX_PYPLUGINS):
-        if d not in os.environ.get("PATH", ""):
+        # split 后精确比较，避免子串误判（如 C:\new_tdx64 匹配 C:\new_tdx64_bak）
+        if d not in os.environ.get("PATH", "").split(os.pathsep):
             os.environ["PATH"] = d + ";" + os.environ.get("PATH", "")
     try:
         # Python 3.8+ 推荐方式
@@ -83,22 +88,16 @@ except ImportError as e:
 
 # Monkey patch: tqcenter 在很多地方会调 cls.close() 把连接关掉，
 # 这会导致 _initialized 翻成 False、下次调用又触发重连循环。
-# 我们包装一个"安全的 close"，只在真正需要时才真关。
+# 我们包装一个"安全的 close"：tqcenter 内部被动触发的 close 一律吞掉；
+# 真正需要关闭的地方（init / close / _test_tdx_init）直接调 _original_close() 显式绕过。
 _original_close = tq.close
 
 def _safe_close():
-    """安全的 close — 只在 atexit / 显式调用时真关，被动触发时不关。
+    """安全的 close — 吞掉 tqcenter 内部被动触发的 close，保持连接复用。
 
-    tqcenter 在错误处理里调的 cls.close() 我们不接管（只 swallow）。
-    用户显式调 tdx_client.close() 时才会真关连接。
+    主动关闭不要走这里，直接调 _original_close()。
     """
-    import traceback
-    tb = traceback.extract_stack()
-    # 如果是 atexit/main 退出触发的，真关
-    if any('atexit' in str(f) or '_auto_close' in str(f) for f in tb[-3:]):
-        return _original_close()
-    # 否则：什么都不做（让连接保持，下次调用还能用）
-    logger.debug("swallow close() from %s", tb[-2].name if len(tb) > 1 else "?")
+    logger.debug("swallow tqcenter internal close()")
 
 tq.close = _safe_close
 
@@ -111,13 +110,15 @@ _last_init_time = 0.0
 _REINIT_INTERVAL = 300  # 5 分钟无活动自动重连一次，避免长期挂载导致句柄僵死
 
 
-def _check_tdx_process_alive() -> bool:
+def _check_tdx_process_alive() -> Optional[bool]:
     """
     检查通达信客户端进程是否在运行。
     用 PowerShell 查询（兼容中文系统 + Windows 编码问题）。
 
     Returns:
         True=至少有一个 TdxW.exe 进程在跑
+        False=确认没在跑
+        None=检查失败（未知），调用处应跳过启动、只做 deep_check
     """
     try:
         import subprocess
@@ -137,8 +138,8 @@ def _check_tdx_process_alive() -> bool:
         result = (out.stdout or "").strip()
         return result.startswith("FOUND:")
     except Exception as e:
-        logger.warning("检查通达信进程失败: %s", e)
-        return False
+        logger.warning("检查通达信进程失败（按未知处理，不触发启动）: %s", e)
+        return None
 
 
 def _start_tdx_client() -> bool:
@@ -151,7 +152,12 @@ def _start_tdx_client() -> bool:
     """
     import subprocess
     import time
-    if _check_tdx_process_alive():
+    alive = _check_tdx_process_alive()
+    if alive is True:
+        return True
+    if alive is None:
+        # 检查失败（PowerShell 超时等）：不贸然再起一个实例，交给调用方的 deep_check 判断
+        logger.warning("进程检查失败（未知），跳过启动，由后续健康检查确认")
         return True
 
     logger.info("通达信客户端未运行，尝试启动: %s", _TDX_EXE)
@@ -203,7 +209,7 @@ def _test_tdx_init() -> bool:
                     snap = tqcenter.tq.get_market_snapshot("600519.SH")
                     ok = bool(snap and "Now" in snap)
                     try:
-                        tqcenter.tq.close()
+                        _original_close()  # 显式绕过 _safe_close 的吞掉逻辑
                     except Exception:
                         pass
                     if ok:
@@ -290,35 +296,35 @@ def init(force: bool = False, auto_start: bool = True) -> bool:
         if _initialized and not force and (now - _last_init_time) < _REINIT_INTERVAL:
             return True
 
-        # 前置守卫：确保通达信客户端在跑
-        if auto_start and not _check_tdx_process_alive():
+        # 前置守卫：确保通达信客户端在跑（None=检查失败，跳过启动，交给后续初始化报错）
+        if auto_start and _check_tdx_process_alive() is False:
             if not _start_tdx_client():
                 logger.error("通达信客户端启动失败，初始化中止")
                 _initialized = False
                 return False
 
-        # 先尝试释放旧连接
+        # 先尝试释放旧连接（显式绕过 _safe_close 的吞掉逻辑）
         if _initialized:
             try:
-                tq.close()
+                _original_close()
             except Exception:
                 pass
             _initialized = False
 
-        try:
-            # 强制 run_mode=1 或更高（mode=0 在反复初始化后会被通达信拒绝，
-            # 通达信对每个 mode 槽位有限制，多次断开后需要切换 mode）
-            # 尝试一组 run_mode 找可用槽位
-            import sys as _sys
-            _sys_argv_orig = list(_sys.argv)
+        # 强制 run_mode=1 或更高（mode=0 在反复初始化后会被通达信拒绝，
+        # 通达信对每个 mode 槽位有限制，多次断开后需要切换 mode）
+        # 尝试一组 run_mode 找可用槽位
+        import sys as _sys
+        _sys_argv_orig = list(_sys.argv)
 
+        try:
             last_err = None
             for try_mode in [1, 2, 3, 0]:  # 优先非 0（0 是用户手动策略的槽位）
                 try:
                     _sys.argv = [_sys_argv_orig[0]] + ['--run_tdx', str(try_mode)]
-                    # 释放旧连接
+                    # 释放旧连接（显式绕过 _safe_close）
                     try:
-                        tq.close()
+                        _original_close()
                     except Exception:
                         pass
                     time.sleep(0.3)
@@ -336,6 +342,8 @@ def init(force: bool = False, auto_start: bool = True) -> bool:
             logger.error("TdxQuant 初始化失败: %s", e)
             _initialized = False
             return False
+        finally:
+            _sys.argv = _sys_argv_orig
 
 
 def health_check() -> bool:
@@ -394,7 +402,11 @@ def _call_with_timeout(func, *args, timeout=None, default=None, label="", **kwar
     th.join(timeout)
     if not box.get("done"):
         logger.warning("%s 超时（%.1fs），返回默认 %s", label or func.__name__, timeout, default)
-        # 注意：tqcenter 阻塞线程仍在跑，下次调用要靠 _REINIT_INTERVAL 强制 init(force=True) 切断
+        # 超时意味着连接可能已僵死：标记断连，让下次调用触发 init(force) 强重连，
+        # 否则泄漏线程持有的旧连接会一直被复用。
+        # 已知限制：超时的 daemon 线程无法强杀，会泄漏到进程结束。
+        global _initialized
+        _initialized = False
         return default
     if "error" in box:
         logger.debug("%s 异常: %s", label or func.__name__, box["error"])
@@ -427,10 +439,12 @@ def get_a_share_list(refresh: bool = False) -> List[Dict]:
     try:
         # market='5' 是沪深京 A 股（实测 5533 只）
         sl = _call_with_timeout(tq.get_stock_list, market="5", list_type=1, default=[], label="get_stock_list") or []
-        _A_SHARE_CACHE = sl
-        _A_SHARE_CACHE_TS = now
+        if sl:
+            # 仅非空才更新缓存：失败空结果不应污染 1h TTL
+            _A_SHARE_CACHE = sl
+            _A_SHARE_CACHE_TS = now
         logger.info("加载 A 股列表: %d 只", len(sl))
-        return sl
+        return sl or _A_SHARE_CACHE or []
     except Exception as e:
         logger.error("get_a_share_list 失败: %s", e)
         return _A_SHARE_CACHE or []
@@ -460,10 +474,12 @@ def get_sectors(refresh: bool = False) -> List[Dict]:
     _ensure_ready()
     try:
         sl = _call_with_timeout(tq.get_sector_list, list_type=1, default=[], label="get_sector_list") or []
-        _SECTOR_CACHE = sl
-        _SECTOR_CACHE_TS = now
+        if sl:
+            # 仅非空才更新缓存：失败空结果不应污染 1h TTL
+            _SECTOR_CACHE = sl
+            _SECTOR_CACHE_TS = now
         logger.info("加载板块列表: %d 个", len(sl))
-        return sl
+        return sl or _SECTOR_CACHE or []
     except Exception as e:
         logger.error("get_sectors 失败: %s", e)
         return _SECTOR_CACHE or []
@@ -533,7 +549,6 @@ def get_snapshot(code: str) -> Dict:
     Returns:
         dict，含 price/open/high/low/volume/amount 等字段；失败返回空 dict
     """
-    global _initialized
     _ensure_ready()
     try:
         raw = _call_with_timeout(tq.get_market_snapshot, code, default={}, label=f"get_snapshot({code})")
@@ -541,10 +556,7 @@ def get_snapshot(code: str) -> Dict:
             return {}
         return _normalize_snapshot(raw, code)
     except Exception as e:
-        # 注意：tqcenter 的 get_market_snapshot 失败时内部会调 cls.close()，
-        # 这会把 _initialized 置 False。重新标记为 True 以避免下次调用又重连。
-        logger.debug("get_snapshot(%s) 失败: %s（保持连接）", code, e)
-        _initialized = True  # 防止 tqcenter 内部的 close 把我们踢出去
+        logger.debug("get_snapshot(%s) 失败: %s", code, e)
         return {}
 
 
@@ -584,7 +596,6 @@ def get_fund_flow(code: str) -> Dict:
     Returns:
         dict，包含主力净流入、撤单金额、封单金额、各周期涨幅等
     """
-    global _initialized
     _ensure_ready()
     try:
         more = _call_with_timeout(tq.get_more_info, code, default=None, label=f"get_more_info({code})")
@@ -605,8 +616,7 @@ def get_fund_flow(code: str) -> Dict:
                 out[f] = v
         return out
     except Exception as e:
-        logger.debug("get_fund_flow(%s) 失败: %s（保持连接）", code, e)
-        _initialized = True  # 防止 tqcenter 内部的 close 把我们踢出去
+        logger.debug("get_fund_flow(%s) 失败: %s", code, e)
         return {"code": code}
 
 
@@ -841,16 +851,21 @@ def _batch_run(func, codes, max_workers, timeout, result_timeout, label, require
     with ThreadPoolExecutor(max_workers=max_workers) as ex:
         future_to_code = {ex.submit(func, c): c for c in codes}
         deadline = time.time() + timeout
-        for fut in as_completed(future_to_code, timeout=timeout):
-            if time.time() > deadline:
-                break
-            code = future_to_code[fut]
-            try:
-                item = fut.result(timeout=result_timeout)
-                if item and (not require_code or item.get("code")):
-                    results.append(item)
-            except Exception as e:
-                logger.debug("%s %s 失败: %s", label, code, e)
+        try:
+            for fut in as_completed(future_to_code, timeout=timeout):
+                if time.time() > deadline:
+                    break
+                code = future_to_code[fut]
+                try:
+                    item = fut.result(timeout=result_timeout)
+                    if item and (not require_code or item.get("code")):
+                        results.append(item)
+                except Exception as e:
+                    logger.debug("%s %s 失败: %s", label, code, e)
+        except TimeoutError:
+            # as_completed 整体超时会抛异常；返回已收集的部分结果，不穿透
+            logger.warning("%s 整体超时（%.1fs），返回 %d/%d 条部分结果",
+                           label, timeout, len(results), len(codes))
     return results
 
 
@@ -925,7 +940,7 @@ def close() -> None:
     with _init_lock:
         if _initialized:
             try:
-                tq.close()
+                _original_close()  # 显式绕过 _safe_close 的吞掉逻辑
             except Exception:
                 pass
             _initialized = False

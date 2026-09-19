@@ -28,8 +28,8 @@ echo.
 REM Python 版本自检（仅提示，不阻断）
 python --version
 
-REM 启动后端（日志写到 logs\ 子目录）
+REM 启动后端（日志追加到 logs\ 子目录；定期清理，无轮转）
 if not exist "logs" mkdir logs
-python stock_dashboard.py 1>logs\dashboard.stdout.log 2>logs\dashboard.stderr.log
+python stock_dashboard.py 1>>logs\dashboard.stdout.log 2>>logs\dashboard.stderr.log
 
 endlocal

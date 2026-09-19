@@ -82,7 +82,7 @@ python stock_dashboard.py
 | `TDX_EXE_NAME` | `TdxW.exe` | 通达信客户端进程名 |
 | `TDX_CALL_TIMEOUT` | `8` | TdxQuant 单次调用超时（秒）。盘中可调小（5），盘后建议放大（12） |
 | `DASHBOARD_PORT` | `8765` | 看板 HTTP 端口 |
-| `DASHBOARD_BIND` | `0.0.0.0` | 绑定地址；容器化时改 `127.0.0.1` |
+| `DASHBOARD_BIND` | `127.0.0.1` | 绑定地址；两个 .bat 启动脚本显式设为 `0.0.0.0` 以便局域网访问，公网环境务必改回 |
 | `DASHBOARD_KEEP_PROXY` | `0` | `1`=保留系统代理；默认会清掉代理环境变量 |
 | `STOCK_FLOW_FEISHU_WEBHOOK` | （空） | 飞书机器人 webhook；不填则异动仅输出 stdout |
 | `TDX_SEND_WARN` | `1` | 异动信号回推通达信 TQ 策略信号窗口（tq.send_warn）；`0`=关闭 |

@@ -1,4 +1,4 @@
-"""
+r"""
 auto_sync.py - 监控 Stock_Dashboard 目录,变动时自动 commit + push 到 GitHub + Gitee
 
 用法:
@@ -17,14 +17,30 @@ import subprocess
 import time
 import datetime
 import sys
+from pathlib import Path
 
-PROJECT_DIR = r"C:\Mac\Home\Desktop\win_WorkSpace_ClaudeCode\Stock_Dashboard"
+PROJECT_DIR = str(Path(__file__).resolve().parent.parent)
 MIN_FILES = 1
 MIN_LINES = 10
 DEBOUNCE_SECONDS = 300
 PUSH_REMOTES = ["github", "gitee"]
 CHECK_INTERVAL = 30
 LOG_FILE = os.path.join(PROJECT_DIR, "logs", "auto_sync.log")
+LOCK_FILE = os.path.join(PROJECT_DIR, "logs", "auto_sync.lock")
+
+
+def acquire_single_instance_lock():
+    """单实例锁：install_task / start_sync / sync_once 三入口不可并存（git 操作会互踩）。
+    拿到锁返回文件句柄（进程退出自动释放）；已有实例在跑则返回 None。"""
+    import msvcrt
+    os.makedirs(os.path.dirname(LOCK_FILE), exist_ok=True)
+    fh = open(LOCK_FILE, "a+b")
+    try:
+        msvcrt.locking(fh.fileno(), msvcrt.LK_NBLCK, 1)
+        return fh
+    except OSError:
+        fh.close()
+        return None
 
 
 def log(msg):
@@ -81,12 +97,14 @@ def commit_and_push():
     if code != 0:
         log(f"add 失败: {err}")
         return False
-    code, _, err = run_git(["commit", "-m", msg])
-    if code != 0 and "nothing to commit" not in err:
-        log(f"commit 失败: {err}")
+    # "nothing to commit" 在 stdout 而非 stderr；改用 diff --cached --quiet 判空（0=无暂存变动）
+    code, _, _ = run_git(["diff", "--cached", "--quiet"])
+    if code == 0:
+        log("无暂存变动,跳过")
         return False
-    if "nothing to commit" in err:
-        log("无变动,跳过")
+    code, out, err = run_git(["commit", "-m", msg])
+    if code != 0:
+        log(f"commit 失败: {err or out}")
         return False
 
     for remote in PUSH_REMOTES:
@@ -131,6 +149,10 @@ def main_loop():
 
 
 if __name__ == "__main__":
+    _lock = acquire_single_instance_lock()
+    if _lock is None:
+        log("已有 auto_sync 实例在运行，本次退出（单实例保护）")
+        sys.exit(0)
     if "--once" in sys.argv:
         # 单次模式:立即提交并推送
         log("单次同步模式(--once)")

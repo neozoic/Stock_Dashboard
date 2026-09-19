@@ -333,6 +333,7 @@ class RealtimeAlertMonitor:
         self._lock = threading.Lock()
 
         self._running = False
+        self._stop_event = threading.Event()  # stop() 时唤醒扫描线程，不用等满一个间隔
         self._thread: Optional[threading.Thread] = None
         self._scan_thread: Optional[threading.Thread] = None
         self._event_queue: Queue = Queue()
@@ -342,7 +343,7 @@ class RealtimeAlertMonitor:
         self.scan_interval_sec = 60     # 全市场扫描间隔（兜底层）
         self.scan_chunk_size = 500      # 每次批量拉多少只的 fund_flow
 
-        # 统计
+        # 统计（多线程自增，需加锁）
         self.stats = {
             'alerts_sent': 0,
             'warn_sent': 0,          # send_warn 回推成功数
@@ -350,6 +351,12 @@ class RealtimeAlertMonitor:
             'scans_done': 0,         # 兜底扫描次数
             'started_at': None,
         }
+        self._stats_lock = threading.Lock()
+
+    def _bump_stat(self, key: str, n: int = 1):
+        """线程安全的 stats 计数器自增（订阅回调/扫描线程/推送线程三方并发）"""
+        with self._stats_lock:
+            self.stats[key] = self.stats.get(key, 0) + n
 
     def init_tq(self, existing_tq=None) -> bool:
         """初始化 tqcenter。
@@ -370,24 +377,29 @@ class RealtimeAlertMonitor:
         # 自己 init
         try:
             import sys as _sys
-            # 用 mode=2/3 避开看板的 mode=0（避免回调表冲突）
-            for try_mode in [2, 3, 1, 0]:
-                _sys.argv = [_sys.argv[0]] + ['--run_tdx', str(try_mode)]
-                try:
-                    # 复用 tdx_client 的路径常量（TDX_HOME / TDX_EXE_NAME 环境变量化）
-                    from tdx_client import _TDX_EXE, _TDX_DLL
-                    self._tq.initialize(
-                        _TDX_EXE,
-                        dll_path=_TDX_DLL,
-                    )
-                    self._initialized = True
-                    logger.info("AlertMonitor: tq init OK (mode=%s, run_id=%s)",
-                                self._tq.run_mode, self._tq.run_id)
-                    return True
-                except Exception as e:
-                    time.sleep(0.3)
-                    continue
-            raise RuntimeError("所有 run_mode 都不可用")
+            # 复用 tdx_client 的路径常量与初始化锁（避免和看板 init 并发篡改 sys.argv / 抢槽位）
+            from tdx_client import _TDX_EXE, _TDX_DLL, _init_lock
+            _sys_argv_orig = list(_sys.argv)
+            try:
+                with _init_lock:
+                    # 用 mode=2/3 避开看板的 mode=0（避免回调表冲突）
+                    for try_mode in [2, 3, 1, 0]:
+                        _sys.argv = [_sys_argv_orig[0]] + ['--run_tdx', str(try_mode)]
+                        try:
+                            self._tq.initialize(
+                                _TDX_EXE,
+                                dll_path=_TDX_DLL,
+                            )
+                            self._initialized = True
+                            logger.info("AlertMonitor: tq init OK (mode=%s, run_id=%s)",
+                                        self._tq.run_mode, self._tq.run_id)
+                            return True
+                        except Exception as e:
+                            time.sleep(0.3)
+                            continue
+                raise RuntimeError("所有 run_mode 都不可用")
+            finally:
+                _sys.argv = _sys_argv_orig
         except Exception as e:
             logger.error("AlertMonitor init 失败: %s", e)
             return False
@@ -431,14 +443,15 @@ class RealtimeAlertMonitor:
 
     def _subscribe(self, codes: List[str]):
         """实际调用 tq.subscribe_hq（最多 100 只）"""
-        # 先 unsubscribe_hq 所有当前订阅（不只是 self._subscribed，还要清 tqcenter 内部状态）
-        try:
-            cur = list(self._tq._sub_hq_update)
-            if cur:
+        # 先退订当前订阅（只维护自有 _subscribed 副本并加锁，不读 tqcenter 私有状态）
+        with self._lock:
+            cur = list(self._subscribed)
+            self._subscribed.clear()
+        if cur:
+            try:
                 self._tq.unsubscribe_hq(stock_list=cur)
-        except Exception as e:
-            logger.debug("清空旧订阅失败: %s", e)
-        self._subscribed.clear()
+            except Exception as e:
+                logger.debug("清空旧订阅失败: %s", e)
 
         if not codes:
             return
@@ -450,15 +463,17 @@ class RealtimeAlertMonitor:
             try:
                 obj = json.loads(datas)
                 code = obj.get('Code')
-                if code and obj.get('ErrorId') == '0':
+                # ErrorId 可能是 str '0' 或 int 0（取决于 tqcenter 版本），统一转 str 比较
+                if code and str(obj.get('ErrorId')) == '0':
                     self._event_queue.put(('update', code))
-                    self.stats['events_received'] += 1
+                    self._bump_stat('events_received')
             except Exception:
                 pass
 
         try:
             self._tq.subscribe_hq(stock_list=codes, callback=on_data)
-            self._subscribed.update(codes)
+            with self._lock:
+                self._subscribed.update(codes)
             logger.info("订阅成功: %d 只", len(codes))
         except Exception as e:
             logger.error("订阅失败: %s", e)
@@ -485,14 +500,18 @@ class RealtimeAlertMonitor:
 
     def stop(self):
         self._running = False
+        self._stop_event.set()  # 唤醒扫描线程，不用等满一个间隔
         if self._thread:
             self._thread.join(timeout=5)
         if self._scan_thread:
             self._scan_thread.join(timeout=5)
         # 清理订阅
-        if self._subscribed:
+        with self._lock:
+            subscribed = list(self._subscribed)
+            self._subscribed.clear()
+        if subscribed:
             try:
-                self._tq.unsubscribe_hq(stock_list=list(self._subscribed))
+                self._tq.unsubscribe_hq(stock_list=subscribed)
             except Exception:
                 pass
         logger.info("AlertMonitor 停止")
@@ -529,10 +548,11 @@ class RealtimeAlertMonitor:
         while self._running:
             try:
                 self._scan_full_market_once()
-                self.stats['scans_done'] += 1
+                self._bump_stat('scans_done')
             except Exception as e:
                 logger.exception("兜底扫描异常: %s", e)
-            time.sleep(self.scan_interval_sec)
+            # Event.wait 可中断：stop() 时立即退出，不用等满一个间隔
+            self._stop_event.wait(self.scan_interval_sec)
 
     def _scan_full_market_once(self):
         """扫一次全集（hot 之外的股票）"""
@@ -545,8 +565,12 @@ class RealtimeAlertMonitor:
         if not to_scan:
             return
 
-        # 分批拉 fund_flow（每批 chunk_size 只）
+        # 分批拉 fund_flow（每批 chunk_size 只），每轮设总时限避免失控
+        round_deadline = time.time() + max(self.scan_interval_sec, 60)
         for i in range(0, len(to_scan), self.scan_chunk_size):
+            if not self._running or time.time() > round_deadline:
+                logger.info("本轮扫描终止（stop 或超过每轮时限）: %d/%d", i, len(to_scan))
+                break
             chunk = to_scan[i:i + self.scan_chunk_size]
             try:
                 flows = self._tq.get_more_info_batch(
@@ -554,16 +578,21 @@ class RealtimeAlertMonitor:
                     field_list=['Zjl', 'ZAF', 'Now', 'Fzhsl'],
                 )
             except AttributeError:
-                # tqcenter 没有批量接口，回退到逐个调
-                flows = [self._tq.get_more_info(c) for c in chunk]
+                # tqcenter 没有批量接口，回退到逐个调（走 tdx_client 超时封装，防止断连卡死）
+                import tdx_client
+                flows = [
+                    tdx_client._call_with_timeout(
+                        self._tq.get_more_info, c, default={}, label=f"scan({c})"
+                    ) for c in chunk
+                ]
             except Exception as e:
                 logger.debug("扫描 batch 失败: %s, 回退逐个", e)
-                flows = []
-                for c in chunk:
-                    try:
-                        flows.append(self._tq.get_more_info(c))
-                    except Exception:
-                        flows.append({})
+                import tdx_client
+                flows = [
+                    tdx_client._call_with_timeout(
+                        self._tq.get_more_info, c, default={}, label=f"scan({c})"
+                    ) for c in chunk
+                ]
 
             # 检测异动
             for code, info in zip(chunk, flows):
@@ -577,14 +606,18 @@ class RealtimeAlertMonitor:
                         logger.info("异动(扫描): %s %s", code, alert.alert_type)
                         send_feishu_text(msg)
                         if send_warn_to_tdx(alert, info):
-                            self.stats['warn_sent'] += 1
-                        self.stats['alerts_sent'] += 1
+                            self._bump_stat('warn_sent')
+                        self._bump_stat('alerts_sent')
             logger.debug("扫描进度: %d/%d", min(i + self.scan_chunk_size, len(to_scan)), len(to_scan))
 
     def _handle_update(self, code: str):
         """处理单只股票的更新通知"""
         try:
-            info = self._tq.get_more_info(code)
+            # 走 tdx_client 超时封装：直调 self._tq 在断连时会永久卡死本线程
+            import tdx_client
+            info = tdx_client._call_with_timeout(
+                self._tq.get_more_info, code, default=None, label=f"alert_update({code})"
+            )
             if not info:
                 return
             name = self._names.get(code, code)
@@ -597,8 +630,8 @@ class RealtimeAlertMonitor:
                     logger.info("异动: %s %s", code, alert.alert_type)
                     send_feishu_text(msg)
                     if send_warn_to_tdx(alert, info):
-                        self.stats['warn_sent'] += 1
-                    self.stats['alerts_sent'] += 1
+                        self._bump_stat('warn_sent')
+                    self._bump_stat('alerts_sent')
         except Exception as e:
             logger.debug("_handle_update(%s) 失败: %s", code, e)
 

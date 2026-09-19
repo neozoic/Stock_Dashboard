@@ -386,7 +386,7 @@ with DATA_LOCK:
 |---|---|---|
 | ~~watchdog 路径漂移~~ ✅ 2026-09-05 已解决 | 旧副本守护已归档脚本 | 权威版重写为 `tools/dashboard_watchdog.py`（路径自定位）；`.hermes` 两份副本改为 thin wrapper 转发调用 |
 | 实时拉数 BASEHTTPR equestHandler 同步阻塞 | 慢请求会阻塞其他请求 30s+ | 已改 ThreadingHTTPServer（2026-08-09）；如需更高并发可再切 aiohttp / FastAPI |
-| `industry/concept` 历史只有累计值 | 趋势图是当日累积曲线，不能看盘中分时占比 | 已提供 `GET /api/minute`（tq.get_market_data 分钟线封装，tdx_client.get_minute_bars）；前端接入待做 |
+| ~~`industry/concept` 历史只有累计值~~ ✅ 前端已接入 | 趋势图是当日累积曲线，不能看盘中分时占比 | 已提供 `GET /api/minute`（tq.get_market_data 分钟线封装，tdx_client.get_minute_bars），dashboard.html 分钟线查询面板已接入 |
 | 日内累积曲线 vs 当日截面对比 | T-5..T 折线图是每只股的净额，趋势图是行业/概念累计（不同语义）| 在前端 UI 区分命名 + hover 说明 |
 | ~~`fetch_once` 仍可能 hang~~ ✅ 2026-09-05 已解决 | 单次 hang 会持续到下次 init | `background_loop` 已加连续超时计数：超时后下一轮前 `init(force=True)` 强制重连（init 本身包 30s 超时）|
 

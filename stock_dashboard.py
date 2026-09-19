@@ -257,8 +257,7 @@ _PERIOD_CACHE = {
     "all_codes": [],     # 全 A 股 codes
 }
 _SECTOR_STOCKS_CACHE = {
-    "ts": 0.0,
-    "data": {},          # block_code -> [codes]
+    "data": {},          # block_code -> {"ts": float, "codes": [..]}
 }
 _CACHE_TTL = 240       # 行情缓存 4 分钟（通达信全 A 股拉一次 ~80s）
 
@@ -316,6 +315,10 @@ def fetch_individual_flows_tdx(top_n=30):
         cache = _get_full_market_data()
         flows = cache["stock_flows"]
         names = cache["stock_names"]
+        if not flows:
+            # 空缓存 = 拉取失败/连接未就绪，返回明确 err，
+            # 让调用方（_fetch_via_tdx）区别于"拉到数据但资金流全 0"
+            return [], [], "tdx 全 A 股资金流为空（拉取失败或连接未就绪）"
         valid = [f for f in flows if f.get("Zjl") is not None]
         valid.sort(key=lambda x: x.get("Zjl", 0), reverse=True)
         top = [_format_stock_row(f["code"], names.get(f["code"], ""), f)
@@ -329,22 +332,20 @@ def fetch_individual_flows_tdx(top_n=30):
 
 
 def _get_sector_stocks_cached(block_code):
-    """获取板块成分股，带 4 分钟缓存"""
-    global _SECTOR_STOCKS_CACHE
+    """获取板块成分股，按 block_code 各自记 ts 的 4 分钟缓存"""
     now = time.time()
-    if _SECTOR_STOCKS_CACHE["ts"] and (now - _SECTOR_STOCKS_CACHE["ts"]) < _CACHE_TTL:
-        if block_code in _SECTOR_STOCKS_CACHE["data"]:
-            return _SECTOR_STOCKS_CACHE["data"][block_code]
+    entry = _SECTOR_STOCKS_CACHE["data"].get(block_code)
+    if entry and (now - entry["ts"]) < _CACHE_TTL:
+        return entry["codes"]
     stocks = tdx_client.get_sector_stocks(block_code)
     codes = [s["Code"] for s in stocks if isinstance(s, dict)
              and s.get("Code", "").endswith((".SH", ".SZ"))]
-    _SECTOR_STOCKS_CACHE["data"][block_code] = codes
-    _SECTOR_STOCKS_CACHE["ts"] = now
+    _SECTOR_STOCKS_CACHE["data"][block_code] = {"ts": now, "codes": codes}
     time.sleep(0.02)
     return codes
 
 
-def fetch_sector_aggregate_tdx(prefix_filter=None, top_n=15, max_sectors=80):
+def fetch_sector_aggregate_tdx(prefix_filter=None, top_n=15, max_sectors=500):
     """
     对板块做资金流聚合：取板块 → 成分股 → 各股 Zjl 求和 → 排序。
     使用共享缓存避免重复拉全 A 股行情。
@@ -357,7 +358,11 @@ def fetch_sector_aggregate_tdx(prefix_filter=None, top_n=15, max_sectors=80):
         if prefix_filter:
             sectors = [s for s in sectors if s["Code"].split(".")[0].startswith(prefix_filter)]
 
+        total_sectors = len(sectors)
         sectors = sectors[:max_sectors]
+        if total_sectors > max_sectors:
+            logger.warning("板块聚合被截断: %d/%d 参与排行（max_sectors=%d）",
+                           len(sectors), total_sectors, max_sectors)
         logger.info("聚合板块数: %d (前缀=%s)", len(sectors), prefix_filter)
 
         # 1) 拿所有板块的成分股（带缓存）
@@ -415,13 +420,15 @@ def fetch_sector_aggregate_tdx(prefix_filter=None, top_n=15, max_sectors=80):
 def fetch_industry_top_tdx(top_n=15):
     """行业资金流排行"""
     rows, err = fetch_sector_aggregate_tdx(prefix_filter=INDUSTRY_PREFIXES, top_n=top_n)
-    return rows[:top_n], rows[-8:][::-1] if len(rows) >= 8 else [], err
+    bottom_n = DEFAULT_FETCH_INDUSTRY_BOTTOM_N
+    return rows[:top_n], rows[-bottom_n:][::-1] if len(rows) >= bottom_n else [], err
 
 
 def fetch_concept_top_tdx(top_n=15):
     """概念资金流排行"""
     rows, err = fetch_sector_aggregate_tdx(prefix_filter=CONCEPT_PREFIXES, top_n=top_n)
-    return rows[:top_n], rows[-5:][::-1] if len(rows) >= 5 else [], err
+    bottom_n = DEFAULT_FETCH_CONCEPT_BOTTOM_N
+    return rows[:top_n], rows[-bottom_n:][::-1] if len(rows) >= bottom_n else [], err
 
 
 # ============================================================
@@ -462,14 +469,24 @@ _THS_PERIOD_COLS = ["序号", "股票代码", "股票简称", "最新价", "阶�
                     "连续换手率", "资金流入净额"]
 
 
+# 同花顺 hexin-v 签名用的 MiniRacer 引擎：模块级缓存一个实例，
+# 避免每页请求都新建引擎（冷启动约百毫秒级）。MiniRacer 非线程安全，调用加锁。
+_THS_JS_LOCK = threading.Lock()
+_THS_JS_ENGINE = None
+
+
 def _ths_signed_headers():
     """生成同花顺 hexin-v 签名请求头（复用 akshare 内置 ths.js）。"""
+    global _THS_JS_ENGINE
     from akshare.stock_feature.stock_fund_flow import _get_file_content_ths, py_mini_racer
-    js = py_mini_racer.MiniRacer()
-    js.eval(_get_file_content_ths("ths.js"))
+    with _THS_JS_LOCK:
+        if _THS_JS_ENGINE is None:
+            _THS_JS_ENGINE = py_mini_racer.MiniRacer()
+            _THS_JS_ENGINE.eval(_get_file_content_ths("ths.js"))
+        hexin_v = _THS_JS_ENGINE.call("v")
     return {
         "Accept": "text/html, */*; q=0.01",
-        "hexin-v": js.call("v"),
+        "hexin-v": hexin_v,
         "Host": "data.10jqka.com.cn",
         "Referer": "http://data.10jqka.com.cn/funds/hyzjl/",
         "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
@@ -499,8 +516,9 @@ def fetch_ths_fund_flow_individual(symbol="即时"):
         page_url = f"http://data.10jqka.com.cn/funds/ggzjl/board/{board}/field/zdf/order/desc/page/{{}}/ajax/1/free/1/"
         col_names = _THS_PERIOD_COLS
 
-    r = requests.get("http://data.10jqka.com.cn/funds/ggzjl/field/code/order/desc/ajax/1/free/1/",
-                     headers=_ths_signed_headers(), timeout=15)
+    session = requests.Session()  # 复用 TCP 连接，逐页重连太浪费
+    r = session.get("http://data.10jqka.com.cn/funds/ggzjl/field/code/order/desc/ajax/1/free/1/",
+                    headers=_ths_signed_headers(), timeout=15)
     soup = BeautifulSoup(r.text, features="lxml")
     page_num = int(soup.find(name="span", attrs={"class": "page_info"}).text.split("/")[1])
 
@@ -508,7 +526,7 @@ def fetch_ths_fund_flow_individual(symbol="即时"):
     bad_pages = 0
     for page in range(1, page_num + 1):
         try:
-            r = requests.get(page_url.format(page), headers=_ths_signed_headers(), timeout=15)
+            r = session.get(page_url.format(page), headers=_ths_signed_headers(), timeout=15)
             dfs = pd.read_html(StringIO(r.text))
         except Exception:
             bad_pages += 1
@@ -734,12 +752,14 @@ def _has_real_money(rows):
 # history series 上限：避免长期跑 series key 单调增长
 MAX_SERIES_KEYS = 500
 SERIES_ZERO_STREAK_THRESHOLD = 30  # 连续 N 个 None 视为可淘汰
+# 各 series 连续 None 计数（模块级，随 history 生命周期；淘汰/新增 key 时同步清理）
+_SERIES_ZERO_STREAK: dict = {}
 
 
 def _push_series(target_dict, name, value, zero_streak_map):
     """单 series 追加 + 长度裁剪 + key 上限保护。
 
-    闭包外的 zero_streak_map 用于跟踪每个 series 连续 None 的次数。
+    zero_streak_map 跨轮累积每个 series 连续 None 的次数，用于淘汰掉榜 series。
     """
     if not isinstance(name, str) or not name:
         return
@@ -754,8 +774,8 @@ def _push_series(target_dict, name, value, zero_streak_map):
             if drop_key:
                 target_dict.pop(drop_key, None)
                 zero_streak_map.pop(drop_key, None)
-        # 新 series 用 None 填充历史空位
-        target_dict[name] = [None] * (len(target_dict.get("__ts__", [])))
+        # 新 series 的历史空位由调用方（_commit_snapshot_and_history）预填 None
+        target_dict[name] = []
     target_dict[name].append(value)
     if value is None or value == 0:
         zero_streak_map[name] = zero_streak_map.get(name, 0) + 1
@@ -779,10 +799,10 @@ def _fetch_via_tdx(now):
         return snapshot, False, False
     tdx_no_fund_flow = False
     try:
-        stock_top, stock_bot, err = fetch_individual_flows_tdx(top_n=DEFAULT_FETCH_STOCK_TOP_N)
+        stock_top, stock_bot, stock_err = fetch_individual_flows_tdx(top_n=DEFAULT_FETCH_STOCK_TOP_N)
         snapshot["stock_top"] = stock_top
         snapshot["stock_bottom"] = stock_bot
-        _accumulate_error(snapshot, "stock", err)
+        _accumulate_error(snapshot, "stock", stock_err)
 
         ind_top, ind_bot, err = fetch_industry_top_tdx(top_n=DEFAULT_FETCH_INDUSTRY_TOP_N)
         snapshot["industry_top"] = ind_top
@@ -794,8 +814,12 @@ def _fetch_via_tdx(now):
         snapshot["concept_bottom"] = con_bot
         _accumulate_error(snapshot, "concept", err)
 
-        # 探测：tdx 跑通但所有净额都是 0 → fallback 到 akshare
-        if not (_has_real_money(stock_top) or _has_real_money(ind_top) or _has_real_money(con_top)):
+        # 探测：tdx 跑通但所有净额都是 0 → fallback 到 akshare。
+        # 仅当个股拉取本身成功（stock_err 为空）时才判"全 0"——
+        # 拉取失败不能计入 noflow 粘性跳过，否则真实连接故障会被错误归因。
+        if stock_err is None and not (
+            _has_real_money(stock_top) or _has_real_money(ind_top) or _has_real_money(con_top)
+        ):
             logger.warning(
                 "tdx 资金流全 0（TQ server 未下发资金流分类数据，level-1 客户端常见），fallback 到 akshare"
             )
@@ -827,7 +851,7 @@ def _fetch_via_akshare_fallback(snapshot):
     return True
 
 
-def _compose_snapshot(now, tdx_no_fund_flow):
+def _compose_snapshot(now):
     """阶段 1+2：组合 snapshot 顶层字段（timestamp/is_trading/error/source）。"""
     return {
         "timestamp": now.strftime("%Y-%m-%d %H:%M:%S"),
@@ -856,26 +880,36 @@ def _commit_snapshot_and_history(snapshot):
         if len(hist["timestamps"]) > HISTORY_MAX:
             del hist["timestamps"][:len(hist["timestamps"]) - HISTORY_MAX]
         n_ts = len(hist["timestamps"]) - 1
-        zero_streak = {}
 
-        for r in snapshot.get("industry_top", [])[:IND_TOP_N]:
-            name = str(r.get("行业", ""))
-            if name and name not in hist["industry"]:
-                hist["industry"][name] = [None] * n_ts
-            _push_series(hist["industry"], name, parse_money_to_yi(r.get("净额")), zero_streak)
-        for r in snapshot.get("stock_top", [])[:STOCK_TOP_N]:
-            name = str(r.get("股票代码", ""))
-            if name and name not in hist["stock"]:
-                hist["stock"][name] = [None] * n_ts
-            _push_series(hist["stock"], name, parse_money_to_yi(r.get("净额")), zero_streak)
-        for r in snapshot.get("concept_top", [])[:CONCEPT_TOP_N]:
-            name = str(r.get("行业", ""))
-            if name and name not in hist["concept"]:
-                hist["concept"][name] = [None] * n_ts
-            _push_series(hist["concept"], name, parse_money_to_yi(r.get("净额")), zero_streak)
+        def _push_group(group_key, rows, name_field, limit):
+            """追加一组 series：在榜的写值，掉榜的旧 key 补 None 保持与 timestamps 对齐。"""
+            target = hist[group_key]
+            seen = set()
+            for r in rows[:limit]:
+                name = str(r.get(name_field, ""))
+                if not name:
+                    continue
+                if name not in target:
+                    target[name] = [None] * n_ts  # 新 series 预填历史空位
+                _push_series(target, name, parse_money_to_yi(r.get("净额")), _SERIES_ZERO_STREAK)
+                seen.add(name)
+            for name in list(target.keys()):
+                if name not in seen:
+                    _push_series(target, name, None, _SERIES_ZERO_STREAK)
 
-        market_net = sum(parse_money_to_yi(r.get("净额")) for r in snapshot.get("industry_top", [])) \
-                   + sum(parse_money_to_yi(r.get("净额")) for r in snapshot.get("industry_bottom", []))
+        _push_group("industry", snapshot.get("industry_top", []), "行业", IND_TOP_N)
+        _push_group("stock", snapshot.get("stock_top", []), "股票代码", STOCK_TOP_N)
+        _push_group("concept", snapshot.get("concept_top", []), "行业", CONCEPT_TOP_N)
+
+        # market_net：top/bottom 在板块总数较少时可能重叠，按行业名去重后求和
+        seen_ind = set()
+        market_net = 0.0
+        for r in snapshot.get("industry_top", []) + snapshot.get("industry_bottom", []):
+            nm = str(r.get("行业", ""))
+            if nm in seen_ind:
+                continue
+            seen_ind.add(nm)
+            market_net += parse_money_to_yi(r.get("净额"))
         hist["market"].append(round(market_net, 2))
         if len(hist["market"]) > HISTORY_MAX:
             del hist["market"][:len(hist["market"]) - HISTORY_MAX]
@@ -897,7 +931,7 @@ def fetch_once():
     """
     with FETCH_LOCK:
         now = bj_now_naive()
-        snapshot = _compose_snapshot(now, False)
+        snapshot = _compose_snapshot(now)
 
         # === 阶段 1：TDX 主路径（资金流持续全 0 时粘性跳过）===
         skip_left = _TDX_NOFLOW["skip_until"] - time.time()
@@ -950,6 +984,15 @@ def background_loop(interval=60, stop_event=None):
             ok = _call_with_timeout(lambda: tdx_client.init(force=True), timeout=30, default=False,
                                     label="background_loop.init(force=True)")
             logger.warning("[bg] TDX 强制重连%s", "成功" if ok else "失败")
+        # 上一轮若 watchdog 超时，僵尸 fetch 线程可能仍持有 FETCH_LOCK——
+        # 此时再跑一轮必然再次超时（连锁超时死循环）。探测到占用则跳过本轮。
+        if not FETCH_LOCK.acquire(blocking=False):
+            consecutive_timeouts += 1
+            logger.warning("[bg] FETCH_LOCK 仍被上一轮占用，跳过本轮（连续 %d 轮）", consecutive_timeouts)
+            if stop_event.wait(timeout=interval):
+                break
+            continue
+        FETCH_LOCK.release()
         # 整轮 watchdog：fetch_once 在 daemon 线程里跑，超时则放弃本轮（保留 LATEST 旧值）
         watchdog = _call_with_timeout(fetch_once, timeout=interval - 5, default=fetch_timeout, label="background_loop.fetch_once")
         if watchdog is fetch_timeout:
@@ -979,7 +1022,7 @@ def period_background_loop(interval=PERIOD_FETCH_INTERVAL, stop_event=None):
             try:
                 t0 = time.time()
                 snap = fetch_akshare_period(period)
-                if snap:
+                if snap and not snap.get("error"):
                     with DATA_LOCK:
                         LATEST["period"][period] = {
                             "stock_top": snap["stock_top"],
@@ -989,6 +1032,12 @@ def period_background_loop(interval=PERIOD_FETCH_INTERVAL, stop_event=None):
                         }
                     print(f"[bg-period] {period} done in {time.time()-t0:.1f}s "
                           f"(top={len(snap['stock_top'])}, bot={len(snap['stock_bottom'])})", flush=True)
+                elif snap:
+                    # 拉取失败：只更新 error/updated，保留上一轮数据，避免瞬时抖动清空榜单
+                    with DATA_LOCK:
+                        LATEST["period"][period]["error"] = snap.get("error")
+                        LATEST["period"][period]["updated"] = bj_now_naive().strftime("%Y-%m-%d %H:%M:%S")
+                    print(f"[bg-period] {period} failed, keep last data: {snap.get('error')}", flush=True)
                 else:
                     print(f"[bg-period] {period} skipped (akshare unavailable)", flush=True)
             except Exception as e:
@@ -1095,6 +1144,10 @@ class Handler(BaseHTTPRequestHandler):
             logger.warning("_send_json_response 序列化失败: %s", e)
             data = b'{"ok":false,"code":500,"error":"serialization_failed"}'
             status = 500
+        self._send_json_data(status, data, extra_headers)
+
+    def _send_json_data(self, status, data: bytes, extra_headers=None):
+        """发送已序列化的 JSON 字节（供锁内完成序列化的调用方使用）。"""
         try:
             self.send_response(status)
             self.send_header("Content-Type", "application/json; charset=utf-8")
@@ -1145,28 +1198,24 @@ class Handler(BaseHTTPRequestHandler):
         elif self.path.startswith("/api/data/period"):
             self._serve_period()
         else:
-            # 兜底：同目录下任意静态文件（如 echarts.min.js、favicon.ico 等）
-            # 仅允许白名单后缀，避免路径穿越
+            # 兜底：仅放行显式白名单内的静态文件（前端实际需要的资源）。
+            # 任何 dotfile（.env/.git/...）、源码、未列名文件一律 404，
+            # 防止 0.0.0.0 绑定时被局域网任意文件读。
             from urllib.parse import unquote
             name = unquote(self.path.lstrip("/"))
-            if ".." in name or name.startswith("/") or "\\" in name:
-                # 路径穿越防御：拒绝 ../、绝对路径、反斜杠；返 JSON 错误便于前端识别
-                logger.warning("拒绝路径穿越请求: %s", self.path)
-                self._send_json_response(400, {"ok": False, "code": 400, "error": "invalid_path"})
-                return
-            ext = os.path.splitext(name)[1].lower()
-            ctype_map = {
-                ".js": "application/javascript; charset=utf-8",
-                ".css": "text/css; charset=utf-8",
-                ".html": "text/html; charset=utf-8",
-                ".htm": "text/html; charset=utf-8",
-                ".json": "application/json; charset=utf-8",
-                ".png": "image/png",
-                ".svg": "image/svg+xml",
-                ".ico": "image/x-icon",
+            _STATIC_WHITELIST = {
+                "dashboard.html": "text/html; charset=utf-8",
+                "index.html": "text/html; charset=utf-8",
+                "echarts.min.js": "application/javascript; charset=utf-8",
+                "mock_data.js": "application/javascript; charset=utf-8",
+                "favicon.ico": "image/x-icon",
             }
-            ctype = ctype_map.get(ext, "application/octet-stream")
-            self._serve_file(name, ctype)
+            if (".." in name or "\\" in name or "/" in name
+                    or name.startswith(".") or name not in _STATIC_WHITELIST):
+                logger.warning("拒绝非白名单静态文件请求: %s", self.path)
+                self._send_not_found()
+                return
+            self._serve_file(name, _STATIC_WHITELIST[name])
 
     def _serve_period(self):
         """GET /api/data/period?p=3d|5d|10d — 近 N 日累计资金流排行"""
@@ -1431,11 +1480,13 @@ class Handler(BaseHTTPRequestHandler):
         self._send_json_response(200, payload)
 
     def _serve_history(self):
+        # 锁内完成序列化：history 是可变结构，锁外 dumps 会与后台追加并发
         with DATA_LOCK:
-            payload = {"history": LATEST["history"]}
-        self._send_json_response(200, payload)
+            body = json.dumps({"history": LATEST["history"]}, ensure_ascii=False, default=str)
+        self._send_json_data(200, body.encode("utf-8"))
 
     def _serve_trend(self):
+        # 锁内完成序列化（同上，防止 RuntimeError: dictionary changed size / 截断 JSON）
         with DATA_LOCK:
             hist = LATEST["history"]
             # names 从 LATEST["stock_top/industry_top/concept_top"] + history 字典 key 合并获取
@@ -1472,7 +1523,8 @@ class Handler(BaseHTTPRequestHandler):
                 },
                 "market_net": LATEST["market_net"],
             }
-        self._send_json_response(200, payload)
+            body = json.dumps(payload, ensure_ascii=False, default=str)
+        self._send_json_data(200, body.encode("utf-8"))
 
     def _serve_health(self):
         health = {
@@ -1512,12 +1564,17 @@ class Handler(BaseHTTPRequestHandler):
                 "hot_watchlist_sample": sorted(m._hot_watchlist)[:10],
             }
         data = json.dumps(payload, ensure_ascii=False).encode("utf-8")
-        self.send_response(200)
-        self.send_header("Content-Type", "application/json; charset=utf-8")
-        self.send_header("Content-Length", str(len(data)))
-        self.send_header("Access-Control-Allow-Origin", "*")
-        self.end_headers()
-        self.wfile.write(data)
+        try:
+            self.send_response(200)
+            self.send_header("Content-Type", "application/json; charset=utf-8")
+            self.send_header("Content-Length", str(len(data)))
+            self.send_header("Access-Control-Allow-Origin", "*")
+            self.end_headers()
+            self.wfile.write(data)
+        except (BrokenPipeError, ConnectionResetError):
+            logger.debug("client disconnected during /api/alerts")
+        except OSError as e:
+            logger.warning("send failed (/api/alerts): %s", e)
 
 
 def _is_port_in_use(port, host="127.0.0.1", timeout=1.5):
@@ -1533,7 +1590,7 @@ def main(port=None, fetch_interval=180):
     # 端口 / 绑定可通过环境变量覆盖
     if port is None:
         port = int(os.environ.get("DASHBOARD_PORT", "8765"))
-    bind_host = os.environ.get("DASHBOARD_BIND", "0.0.0.0")
+    bind_host = os.environ.get("DASHBOARD_BIND", "127.0.0.1")  # 默认仅本机；局域网访问需显式设 0.0.0.0
 
     # 启动前端口占用自检：占用时直接报错退出，提示如何清理残留进程
     if _is_port_in_use(port):

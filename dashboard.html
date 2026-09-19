@@ -487,7 +487,8 @@ const charts = {
 const _setChartOption = (chart, opt) => {
   if (!chart) return;
   if (chart.__built) {
-    chart.setOption(opt, false);
+    // replaceMerge series：TOP 名单变化时被挤出的旧曲线会被移除，不再残留幽灵 series
+    chart.setOption(opt, { replaceMerge: ["series"] });
   } else {
     chart.setOption(opt, true);
     chart.__built = true;
@@ -497,6 +498,8 @@ const _setChartOption = (chart, opt) => {
 const COLORS = [
   "#f6465d", "#4f9cf9", "#e8b33e", "#a371f7", "#2ebd85",
   "#56d4dd", "#ff9f5a", "#f778ba", "#7ee787", "#ff8a96",
+  "#c98bff", "#5ac8fa", "#ffd60a", "#66e3a3", "#ff6b81",
+  "#8ea1ff", "#d4a017", "#40c4b6", "#e879f9", "#94a3b8",
 ];
 
 const COLOR_UP = "#f6465d";
@@ -511,9 +514,16 @@ function hexA(hex, a) {
   return `rgba(${(n >> 16) & 255}, ${(n >> 8) & 255}, ${n & 255}, ${a})`;
 }
 
+// 上游数据(股票简称/代码等)直接进 innerHTML，必须转义防 XSS
+function escapeHtml(s) {
+  return String(s).replace(/[&<>"']/g, c => ({
+    "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;",
+  })[c]);
+}
+
 function fmt(v) {
   if (v === null || v === undefined || v === "") return "-";
-  return String(v);
+  return escapeHtml(v);
 }
 
 // 统一金额解析:"亿/万/%"字符串 → 亿为单位的数值;无效输入返回 null
@@ -575,7 +585,7 @@ function maxAbsNet(rows) {
 function renderDualStockTable(tbody, topRows, botRows) {
   if (!tbody) return;
   const hasInflow = (topRows || []).some(r => r && r["流入资金"] !== undefined);
-  const hasOutflow = (topRows || []).some(r => r && r["流出资金"] !== undefined);
+  const hasOutflow = (botRows || []).some(r => r && r["流出资金"] !== undefined);
   const leftCols = hasInflow ? 4 : 3;
   const rightCols = hasOutflow ? 4 : 3;
   const totalCols = leftCols + rightCols;
@@ -896,6 +906,7 @@ function renderTrendSeries(chart, timestamps, dataDict, nameMap) {
   }
   const series = buildSeries(dataDict, nameMap, timestamps);
   _setChartOption(chart, {
+    title: { text: "" },  // 清掉"暂无数据"占位（merge 模式不会自动删 title）
     backgroundColor: "transparent",
     textStyle: { color: "#e8ecf3", fontSize: 12 },
     ...CHART_CURSOR_OPT,
@@ -928,6 +939,7 @@ function renderMarketTrend(chart, timestamps, market) {
   const areaTopColor = cur >= 0 ? hexA(COLOR_UP, 0.35) : hexA(COLOR_DOWN, 0.35);
   const points = timestamps.map((t, idx) => [toTradingMin(t), market[idx]]);
   _setChartOption(chart, {
+    title: { text: "" },  // 清掉"暂无大盘数据"占位
     backgroundColor: "transparent",
     textStyle: { color: "#e8ecf3", fontSize: 12 },
     ...CHART_CURSOR_OPT,
@@ -1115,17 +1127,19 @@ function renderDailyTopChart(d) {
 
   for (let i = 0; i < have; i++) {
     const day = daily[i];
+    // 右对齐：数据不足 requested 天时，最新一天落在 T（索引 requested-1）
+    const dayIdx = requested - have + i;
     for (const r of (day.stock_top || [])) {
       const code = r["股票代码"];
       const v = parseYi(r["净额"]);
       if (v === null) continue;
-      addRow(code, r["股票简称"], v, i, true);
+      addRow(code, r["股票简称"], v, dayIdx, true);
     }
     for (const r of (day.stock_bottom || [])) {
       const code = r["股票代码"];
       const v = parseYi(r["净额"]);
       if (v === null) continue;
-      addRow(code, r["股票简称"], v, i, false);
+      addRow(code, r["股票简称"], v, dayIdx, false);
     }
   }
 
@@ -1178,7 +1192,9 @@ function renderDailyTopChart(d) {
   const tooltipFormatter = (params) => {
     if (!params || !params.length) return "";
     const idx = params[0].dataIndex;
-    const day = idx < have ? daily[idx] : null;
+    // 与右对齐一致：X 轴索引回推 daily 下标
+    const dayIdx = idx - (requested - have);
+    const day = dayIdx >= 0 && dayIdx < have ? daily[dayIdx] : null;
     let html = `<div style="font-size:12px;line-height:1.5;max-width:380px;">`;
     html += `<b>${xLabels[idx]}${day ? ` (${day.date || ""})` : ""}</b><br/>`;
     if (day) {
@@ -1292,28 +1308,12 @@ async function fetchTrend() {
     const r = await fetch("/api/trend", { cache: "no-store" });
     if (!r.ok) return;
     const d = await r.json();
-    const cutoff = 24 * 60;
-    const allTs = d.timestamps || [];
-    const indices = [];
-    for (let i = 0; i < allTs.length; i++) {
-      const parts = allTs[i].split(":");
-      const hh = Number(parts[0]) || 0;
-      const mm = Number(parts[1]) || 0;
-      if (hh * 60 + mm <= cutoff) indices.push(i);
-    }
-    const ts = indices.map(i => allTs[i]);
+    const ts = d.timestamps || [];
     const names = d.names || {};
-    const filterArr = arr => indices.map(i => arr[i]);
-    renderTrendSeries(charts.stock, ts, Object.fromEntries(
-      Object.entries(d.stock || {}).map(([k, v]) => [k, filterArr(v)])
-    ), names.stock || {});
-    renderTrendSeries(charts.industry, ts, Object.fromEntries(
-      Object.entries(d.industry || {}).map(([k, v]) => [k, filterArr(v)])
-    ), names.industry || {});
-    renderTrendSeries(charts.concept, ts, Object.fromEntries(
-      Object.entries(d.concept || {}).map(([k, v]) => [k, filterArr(v)])
-    ), names.concept || {});
-    const marketArr = filterArr(d.market || []);
+    renderTrendSeries(charts.stock, ts, d.stock || {}, names.stock || {});
+    renderTrendSeries(charts.industry, ts, d.industry || {}, names.industry || {});
+    renderTrendSeries(charts.concept, ts, d.concept || {}, names.concept || {});
+    const marketArr = d.market || [];
     renderMarketTrend(charts.market, ts, marketArr);
     updateMarketKpi(
       typeof d.market_net === "number" ? d.market_net
@@ -1324,6 +1324,7 @@ async function fetchTrend() {
 
 // ============ 分钟线 / K 线 (/api/minute) ============
 let lastMinuteQuery = null;
+let minuteReqSeq = 0;  // 请求序号：轮询与手动并发时只接受最新响应
 
 function setMinuteMsg(text, isErr) {
   const el = document.getElementById("minute-msg");
@@ -1355,6 +1356,7 @@ function renderMinuteChart(payload) {
     itemStyle: { color: (close[i] >= open[i]) ? COLOR_UP : COLOR_DOWN },
   }));
   _setChartOption(charts.minute, {
+    title: { text: "" },  // 清掉占位提示（merge 模式不会自动删 title）
     backgroundColor: "transparent",
     textStyle: { color: "#e8ecf3", fontSize: 12 },
     animation: false,
@@ -1412,11 +1414,13 @@ async function fetchMinute() {
     return;
   }
   lastMinuteQuery = { code, period };
+  const seq = ++minuteReqSeq;
   setMinuteMsg("加载中…");
   try {
     const r = await fetch(
       `/api/minute?code=${encodeURIComponent(code)}&period=${period}&count=240`,
       { cache: "no-store" });
+    if (seq !== minuteReqSeq) return;  // 已有更新的请求发出，丢弃本次旧响应
     const d = await r.json().catch(() => ({}));
     if (!r.ok) {
       setMinuteMsg(d.message || `请求失败 (${r.status})`, true);
@@ -1426,6 +1430,7 @@ async function fetchMinute() {
     setMinuteMsg("");
     renderMinuteChart(d);
   } catch (e) {
+    if (seq !== minuteReqSeq) return;  // 旧请求的网络错误不打断新查询
     setMinuteMsg("网络错误", true);
   }
 }
@@ -1454,6 +1459,20 @@ function updateClocks() {
   if (nyEl) nyEl.textContent = ny;
 }
 
+// Intl.DateTimeFormat 构造昂贵，按时区模块级缓存（心跳每秒调用多次）
+const _dtfCache = {};
+function _getDtf(tz) {
+  if (!_dtfCache[tz]) {
+    _dtfCache[tz] = new Intl.DateTimeFormat("en-CA", {
+      timeZone: tz, hour12: false,
+      year: "numeric", month: "2-digit", day: "2-digit",
+      hour: "2-digit", minute: "2-digit", second: "2-digit",
+      weekday: "short",
+    });
+  }
+  return _dtfCache[tz];
+}
+
 function nextOpenCountdown(now, tz, openHour, openMinute, sessions, extra) {
   extra = extra || {};
   const pre = extra.pre || [];
@@ -1461,12 +1480,7 @@ function nextOpenCountdown(now, tz, openHour, openMinute, sessions, extra) {
   const overnight = extra.overnight || [];
   const workdays = extra.workdays || [1, 2, 3, 4, 5];
 
-  const localFmt = new Intl.DateTimeFormat("en-CA", {
-    timeZone: tz, hour12: false,
-    year: "numeric", month: "2-digit", day: "2-digit",
-    hour: "2-digit", minute: "2-digit", second: "2-digit",
-    weekday: "short",
-  });
+  const localFmt = _getDtf(tz);
   const parts = localFmt.formatToParts(now).reduce((acc, p) => {
     if (p.type !== "literal") acc[p.type] = p.value;
     return acc;
@@ -1496,6 +1510,9 @@ function nextOpenCountdown(now, tz, openHour, openMinute, sessions, extra) {
     if (curMin < firstStart) {
       // 用 nextOpenCountdown 自己的 firstStart 算今天开盘 ms
       const nextUtc = _composeNextUtc(parts, wdMap, workdays, now, firstStart, openHour, openMinute, tz);
+      if (nextUtc === null) {
+        return _calcNextOpen(now, tz, parts, wdMap, workdays, y, mo, d, curMin, s, openHour, openMinute);
+      }
       const remainMs = nextUtc - now.getTime();
       return { state: "closed", text: `距开盘 ${fmtDuration(remainMs)}` };
     }
@@ -1551,17 +1568,14 @@ function nextOpenCountdown(now, tz, openHour, openMinute, sessions, extra) {
 function _composeNextUtc(parts, wdMap, workdays, now, targetStartMin, openHour, openMinute, tz) {
   // 构造"目标工作日"的"年-月-日 在 tz 下的 09:30:00"对应的 UTC 毫秒。
   // 关键:不把 gSec 加进去,否则 nextUtc 会随 now 的秒数同步偏移,导致 remain 永远不变。
-  const targetFmt = new Intl.DateTimeFormat("en-CA", {
-    timeZone: tz, hour12: false, weekday: "short",
-    year: "numeric", month: "2-digit", day: "2-digit",
-    hour: "2-digit", minute: "2-digit", second: "2-digit",
-  });
+  const targetFmt = _getDtf(tz);
   const localParts = (date) => targetFmt.formatToParts(date).reduce((acc, p) => {
     if (p.type !== "literal") acc[p.type] = p.value;
     return acc;
   }, {});
 
-  for (let n = 1; n <= 8; n++) {
+  // 从 n=0（今天）开始：盘前场景需要"今天 09:30"；nextUtc > now 的判断会排除过去时刻
+  for (let n = 0; n <= 8; n++) {
     const guess = new Date(now.getTime() + n * 24 * 3600 * 1000);
     const gp = localParts(guess);
     if (!workdays.includes(wdMap[gp.weekday])) continue;
