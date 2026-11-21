@@ -1,0 +1,35 @@
+# 统一行尾策略，避免 Windows / macOS 交叉编辑产生整文件假 diff。
+#
+# 背景：仓库里 .py/.js/.html 等曾以 CRLF 存储，而工作区在 macOS 上是 LF，
+# 导致 git diff 每次都显示"整文件被改"（stock_dashboard.py 一度显示 3344 行变动，
+# 实际只有行尾差异）。规范化后 diff 只剩真实改动。
+
+# 默认：文本文件入库统一 LF，检出时按平台转换
+* text=auto
+
+# 明确的文本类型
+*.py    text eol=lf
+*.js    text eol=lf
+*.mjs   text eol=lf
+*.ts    text eol=lf
+*.html  text eol=lf
+*.css   text eol=lf
+*.md    text eol=lf
+*.txt   text eol=lf
+*.toml  text eol=lf
+*.json  text eol=lf
+*.yml   text eol=lf
+*.yaml  text eol=lf
+
+# Windows 批处理必须是 CRLF，否则双击不执行
+*.bat   text eol=crlf
+
+# 二进制，不做行尾转换
+*.png   binary
+*.jpg   binary
+*.gif   binary
+*.ico   binary
+*.exe   binary
+*.dll   binary
+*.woff  binary
+*.woff2 binary

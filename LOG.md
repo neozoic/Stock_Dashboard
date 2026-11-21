@@ -1,3 +1,14 @@
+---
+title: "Stock_Dashboard 项目日志"
+description: "A 股资金流实时看板："
+type: reference
+tags:
+  - 记录
+created: 2026-09-19
+updated: 2026-10-05
+related:
+  []
+---
 # Stock_Dashboard 项目日志
 
 > 最后更新：2026-09-07
