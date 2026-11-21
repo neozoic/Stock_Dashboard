@@ -37,7 +37,8 @@ jobs:
 
       - name: 确认没有凭证入库
         run: |
-          if git ls-files | grep -qE '^\.env($|\.)'; then
+          # .env.example / .env.template 是模板（无敏感信息），不视为泄露
+          if git ls-files | grep -E '^\.env$|^\.env\.[a-z]' | grep -vE '\.(example|template)$' | grep -q .; then
             echo "❌ 检测到 .env 被跟踪"
             exit 1
           fi
