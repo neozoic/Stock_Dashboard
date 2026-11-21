@@ -1,0 +1,44 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  test:
+    name: 语法检查
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+
+      - name: Python 语法检查
+        run: |
+          for f in *.py tools/*.py; do
+            python -m py_compile "$f" || exit 1
+          done
+          echo "✓ 全部 Python 文件语法通过"
+
+      - name: JS 语法检查
+        run: |
+          for f in mock_data.js; do
+            node --check "$f" || exit 1
+          done
+          echo "✓ JS 语法通过"
+
+      - name: 确认没有凭证入库
+        run: |
+          if git ls-files | grep -qE '^\.env($|\.)'; then
+            echo "❌ 检测到 .env 被跟踪"
+            exit 1
+          fi
+          echo "✓ 无 .env 被跟踪"
