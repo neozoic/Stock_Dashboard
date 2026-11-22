@@ -103,9 +103,9 @@ A 股资金流实时看板：
 
 | # | 项目 | 现状 | 缓解 |
 |---|---|---|---|
-| 1 | 默认绑定 `0.0.0.0` 暴露公网 | `main()` 默认 `bind_host = "0.0.0.0"` | 启动前 `set DASHBOARD_BIND=127.0.0.1` 或 Nginx 反代 |
-| 2 | 无访问控制 / 鉴权 | `Handler.do_GET` 无任何 token / IP 白名单 | 加 `Authorization` Bearer token，或 nginx basic_auth |
-| 3 | 静态文件白名单路由 | 已实现，但缺 `.json` mime 与 ETag | 已加 `Cache-Control: no-store`；建议加 ETag/304 |
+| 1 | 默认绑定 `0.0.0.0` 暴露公网 | ✅ 2026-11-22 已修：`stock_dashboard.py` 默认已是 `127.0.0.1`；watchdog 仍显式设 `0.0.0.0`（用户拍板：Parallels NAT 私有网络，需局域网访问） | 已配可选 Bearer token；如需收紧改 `DASHBOARD_BIND=127.0.0.1` |
+| 2 | 无访问控制 / 鉴权 | ✅ 2026-11-22 已加**可选** Bearer token（`DASHBOARD_TOKEN`，默认关闭不打断现有调用）；同时把 `Access-Control-Allow-Origin: *` 收敛为默认不发（需跨域时配 `DASHBOARD_CORS_ORIGIN`） | 启用方式：设 `DASHBOARD_TOKEN` 环境变量 |
+| 3 | 静态文件白名单路由 | ✅ 2026-11-22 已加 ETag/304（HTML 用 no-store，其余 no-cache + ETag）；并修掉"路由未剥离 query string"（`/api/data?t=1` 曾 404）与"缺失文件断连无响应"两个缺陷 | 已完成 |
 | 4 | 路径穿越 | `do_GET` else 分支已检查 `.. / / / \\` | ✅ 已防御 |
 | 5 | subprocess / eval / exec | 全代码无 `subprocess.Popen(shell=True)` 用户输入拼接、无 `eval/exec` | ✅ 已审计 |
 | 6 | 日志泄漏敏感数据 | stderr 走 `logs/`；无 token/webhook URL 写日志 | ✅ 安全 |
@@ -406,6 +406,13 @@ with DATA_LOCK:
 | ~~日志轮转在 Windows 上把文件撑成巨大空洞~~ ✅ 2026-11-22 已解决 | `os.truncate` 截断被看板持有的文件后，写入方偏移量不回退，下次写入在文件头补出 2.86MB 的 NUL 空洞（stderr 2.9MB 里 2.86MB 是空洞，grep 认成二进制） | 业务日志改由看板自己的 `RotatingFileHandler` 写 `logs/dashboard.log`（先 close 再 rename，Windows 上可行且无空洞）；keepalive 的 `rotate_logs` 不再退化成截断，改名失败只告警 |
 | ~~非交易时段仍在全市场扫描~~ ✅ 2026-11-22 已解决 | 周末/收盘后兜底线程每 60 秒扫 5000+ 只，把收盘时的同一批涨跌停反复推一遍（单日近 900 条重复异动），每轮约 5000 次 TQ 调用 | `alert_monitor.in_trading_hours()`（北京时间，与看板一致）作为闸门：非交易时段跳过兜底扫描与推送线程处理，开盘后自动恢复 |
 | ~~重启限流会把看板永久挡在门外~~ ✅ 2026-11-22 已解决 | 限流只看"1 小时内重启次数"，早上恢复过的 3 次一直占着预算；看板稳定运行半小时后被正常杀进程，keepalive 拒绝拉起 → 看板停机 | 改为两级限流：15 分钟窗口内最多 3 次（挡住崩溃循环）+ 1 小时内最多 10 次（防缓慢抖动） |
+| ~~TQ 连接每 300s 强制重连把通达信客户端搞崩~~ ✅ 2026-11-22 已解决 | `init(force=True)` 对活跃连接连续 CloseConnect → 通达信客户端写回共享内存时命中失效句柄 → TdxW.exe 访问冲突崩溃（实测 Event ID 1000 / 0xc0000005） | 取消周期性强制重连（改为按需重建）、重建前等在途调用归零、每个连接只 CloseConnect 一次；客户端崩溃归零 | 
+| ~~`/api/health` 实时调 TQ 造成重启风暴~~ ✅ 2026-11-22 已解决 | 健康检查带 3s 超时调 TQ，全市场扫描期间必然超时 → 误报 `tdx_health=fail` → keepalive 连续 3 次后重启看板 | 改为只读 `TDX_HEALTH` 缓存（ok/fail/busy/idle/unknown），keepalive 只把 `fail` 当故障 | 
+| ~~`close()` 被 `_initialized` 门控导致 TQ 槽位永不归还~~ ✅ 2026-11-22 已解决 | 超时路径把 `_initialized` 置 False 后，`close()` 空转 → 真实连接一直占着 mode 槽位，4 个烧光 TQ 再也起不来 | `close()` 无条件真实关闭 + 拿锁带超时；`os._exit` 前先 close | 
+| ~~两个 5 分钟调度器同时驱动 keepalive~~ ✅ 2026-11-22 已解决 | Windows 计划任务 + hermes cron 各跑一份，双倍消耗限流预算、共同落进看板启动空窗 | 停用 hermes cron（保留计划任务）+ 新增看板"启动中"标记 + 文件锁互斥 | 
+| ~~休市时趋势图"有坐标轴无曲线"~~ ✅ 2026-11-22 已解决 | X 轴是固定交易分钟刻度 [0,270]，而时间戳是拉数时刻墙钟时间（休市时 23:08 → 728），点全在轴域外被裁掉；另外下午段映射用 m-90 整体错 30 分钟 | `toTradingMin` 出域返回 null 并修正下午偏移（13:00→150、15:00→270）；后端非交易时段不写 history；前端显示"休市 / 非交易时段"空状态 | 
+| ~~告警链路大面积静默失效~~ ✅ 2026-11-22 已解决 | `send_warn` 缺 `volum_list` 每次必失败；`get_more_info_batch` 根本不存在；扫描游标不轮转导致后一半代码永远扫不到；TQ 重连后订阅丢失不重建；不判法定节假日 | 补 volum_list、改用 `batch_get_more_info`、扫描游标轮转、按连接世代自动重订阅、接 akshare 交易日历 | 
+| ~~查询串导致 API 404 / 缺失文件断连~~ ✅ 2026-11-22 已解决 | `/api/data?t=1` → 404；`/favicon.ico` → 一个响应都不发直接断连 | 路由前 `urlsplit(self.path).path`；`FileNotFoundError` 排在 `OSError` 之前 | 
 
 ---
 
@@ -430,6 +437,7 @@ with DATA_LOCK:
 
 ---
 
+| 2026-11-22 | **全面巡检 + 四轮修复**（自主巡检，非用户驱动）。起因：07:35 看板与通达信同时哑火、08:19 重启后都没自启（同日第一轮加固的起因）。本轮做了三件事。**① 全面巡检**：3 个只读子代理分域审查（后端 / TQ 与告警 / 运维与安全）+ 主控侧运行期实测复核，产出 `AUDIT_2026-11-22.md`（已 gitignore，不进公开仓库）。**② 定位到一条自激故障链**：`tdx_client` 每 300s 强制重连 → 对活跃连接连续 CloseConnect → 通达信客户端写回共享内存时命中失效句柄 → **TdxW.exe 访问冲突崩溃**（实测 Event ID 1000 / 0xc0000005 / 10:00:57）→ 看板 TQ 调用挂死 → `/api/health` 的 3s 超时误报 `tdx_health=fail` → keepalive 连续 3 次后重启看板 → `close()` 被 `_initialized` 门控跳过 → **TQ 槽位不归还** → 下次 init 顺延 mode → 4 个烧光后 TQ 再也起不来。雪上加霜的是**两个 5 分钟调度器同时驱动同一份 keepalive**（Windows 计划任务 `Stock_Dashboard_KeepAlive` + hermes cron `看板 watchdog`，实测 10:10:01 / 10:10:36），把每次误判放大一倍。**③ 四批修复**。**B1 稳定性根因**：`close()` 改无条件真实关闭 + 拿锁带超时；取消 300s 强制重连，改为按需重建；`init()` 重建前等在途 TQ 调用归零（新增 `_inflight` 计数）、每个连接只 CloseConnect 一次；探针 `_test_tdx_init` 的 close 移进 `finally` 且不再关看板正在用的共享连接；`health_check` 加超时且超时不污染连接状态；`/api/health` 改读 `TDX_HEALTH` 缓存；关停路径 close 放独立线程限时等待 + `os._exit` 兜底前置；`ThreadingHTTPServer` 移进 try（原来 bind 失败会让 3 个非守护线程把进程挂死、槽位永不休）；非交易时段拉数降频到 1 小时；watchdog 超时与"跳过本轮"拆成两个计数器。**B2 keepalive 状态机**：新增看板"启动中"标记（防第二个触发源强杀刚拉起的实例）；健康语义区分 ok/fail/busy/idle/unknown（只把 fail 当故障）；限流检查前置到所有破坏性动作之前；只杀自己拉起的通达信 PID；状态文件原子写 + 备份；锁改 `msvcrt` 文件锁；端口清理校验进程身份；拉起失败不占重启预算；`--reset-budget` 改到拿锁之后再改状态。**B3 告警链路**：`send_warn` 补 `volum_list`（原来每次必失败）；新增 `batch_get_more_info` 替掉不存在的 `get_more_info_batch`；扫描游标轮转（原来后一半代码永远扫不到）；按 `tdx_client` 连接世代自动重订阅；接 akshare 交易日历排除法定节假日；Throttler 加日级去重；订阅返回值校验；`stop_event` 复位。**B4 前端**：各图加"口径"说明；`toTradingMin` 出域返回 null 并修正下午盘 30 分钟错位；休市显示"休市 / 非交易时段：暂无当日分时数据"空状态（原来是有坐标轴无曲线）；修分钟线"价格"轴被永久隐藏；`fetchData`/`fetchTrend` 加请求序号守卫；加 `visibilitychange` 补刷；标签"每 30s 一个点"改"每 3 分钟一点"。**B5 安全**：可选 Bearer token（`DASHBOARD_TOKEN`，默认关闭）；CORS 从 `*` 收敛为默认不发；静态资源 ETag/304；`.gitignore` 补 `.env`（防飞书 webhook 密钥被 auto_sync 推到公开仓库）。**验证**：`tools/smoke_test.py`（新增，24 项全过，含 `node --check` 前端语法检查）；强杀看板演练 → keepalive **15.7 秒**自愈且"TQ 接口已就绪 探测 1 次"；两道防线实测生效（`[SKIP] 另一个 watchdog 实例正在运行` / `看板正在启动中（177s 后再判定）`）；告警 `events_received` 从 **0 → 34**（订阅重建修复生效）；交易日历实测 2026-10-01/10-02/01-01 均判为非交易日。 |
 ## 15. 联系与维护
 
 - 看板作者：openclaw

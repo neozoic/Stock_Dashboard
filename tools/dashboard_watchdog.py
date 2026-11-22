@@ -50,8 +50,8 @@ TDX_HOME = Path(os.environ.get("TDX_HOME", r"C:\new_tdx64"))
 
 KEEPALIVE_LOG = LOG_DIR / "keepalive.log"
 STATE_FILE = LOG_DIR / "keepalive_state.json"
+STATE_BACKUP_FILE = LOG_DIR / "keepalive_state.json.bak"
 LOCK_FILE = LOG_DIR / "keepalive.lock"
-LOCK_STALE_SECONDS = 900  # 锁文件超过 15 分钟视为陈旧（上次进程崩了）
 
 # 日志滚动阈值
 LOG_MAX_BYTES = int(os.environ.get("DASHBOARD_LOG_MAX_BYTES", 8 * 1024 * 1024))
@@ -66,6 +66,9 @@ MAX_RESTARTS_BURST = int(os.environ.get("DASHBOARD_MAX_RESTARTS_BURST", 3))
 RESTART_BURST_WINDOW = int(os.environ.get("DASHBOARD_RESTART_BURST_WINDOW", 900))
 # 拉起通达信后等 TQ 接口就绪的最长时间（秒）
 TDX_READY_TIMEOUT = int(os.environ.get("DASHBOARD_TDX_READY_TIMEOUT", 120))
+# 看板"启动中"窗口（秒）：进程起来到 bind 端口要 ~20s（探 TQ + 首轮拉数更久）。
+# 这个窗口内如果又来一次触发，不能判定"看板死了"去强杀 —— 那会烧掉一个 TQ 槽位
+DASHBOARD_STARTING_WINDOW = int(os.environ.get("DASHBOARD_STARTING_WINDOW", 180))
 # TQ 槽位耗尽时重启通达信客户端的限流（1 小时内最多几次）
 MAX_TDX_RESTARTS_PER_HOUR = int(os.environ.get("DASHBOARD_MAX_TDX_RESTARTS_PER_HOUR", 1))
 
@@ -97,45 +100,45 @@ def log(msg: str, quiet: bool = False) -> None:
 # ============================================================
 # 互斥锁（登录自启 + 定时任务可能撞在一起）
 # ============================================================
+_lock_fh = None
+
+
 def acquire_lock() -> bool:
-    """同一时刻只允许一个 watchdog 实例在跑"""
+    """同一时刻只允许一个 watchdog 实例在跑。
+
+    用 msvcrt 文件锁（进程退出自动释放），不再用"创建标志文件"：
+      标志文件方案有两个坑 —— ① os.open(O_EXCL) 与 f.write() 之间有窗口
+      （共享目录上是毫秒级），另一个实例读到空内容会走 except 分支判定
+      "陈旧"，从而**删掉对方的锁**，两个实例并行跑（重复拉起 + 烧槽位）；
+      ② 进程崩了锁文件残留，得靠时间戳兜底。
+    OS 托管的文件锁没有这两个坑。
+    """
+    global _lock_fh
+    import msvcrt
     LOG_DIR.mkdir(parents=True, exist_ok=True)
-    for _ in range(2):
+    try:
+        fh = open(LOCK_FILE, "a+b")
+        fh.seek(0)
+        msvcrt.locking(fh.fileno(), msvcrt.LK_NBLCK, 1)
+        _lock_fh = fh
+        return True
+    except OSError:
+        log("[SKIP] 另一个 watchdog 实例正在运行，本次跳过")
         try:
-            fd = os.open(str(LOCK_FILE), os.O_CREAT | os.O_EXCL | os.O_WRONLY)
-            with os.fdopen(fd, "w", encoding="utf-8") as f:
-                f.write(f"{os.getpid()} {time.time()}")
-            return True
-        except FileExistsError:
-            stale = False
-            try:
-                content = LOCK_FILE.read_text(encoding="utf-8").strip().split()
-                pid = int(content[0])
-                stamp = float(content[1])
-                if time.time() - stamp > LOCK_STALE_SECONDS:
-                    stale = True
-                else:
-                    try:
-                        os.kill(pid, 0)  # 探活：进程还在说明真有实例在跑
-                    except OSError:
-                        stale = True
-            except Exception:
-                stale = True
-            if not stale:
-                log("[SKIP] 另一个 watchdog 实例正在运行，本次跳过")
-                return False
-            try:
-                LOCK_FILE.unlink()
-            except OSError:
-                return False
-    return False
+            fh.close()
+        except Exception:
+            pass
+        return False
 
 
 def release_lock() -> None:
-    try:
-        LOCK_FILE.unlink()
-    except OSError:
-        pass
+    global _lock_fh
+    if _lock_fh is not None:
+        try:
+            _lock_fh.close()
+        except Exception:
+            pass
+        _lock_fh = None
 
 
 # ============================================================
@@ -147,14 +150,49 @@ def load_state() -> dict:
             st = json.load(f)
         if isinstance(st, dict):
             return st
-    except Exception:
+        log("[WARN] keepalive 状态文件格式异常，按空状态处理")
+    except FileNotFoundError:
         pass
+    except Exception as e:
+        # JSON 损坏时**不能**静默归零 —— 归零等于清空限流预算，
+        # 崩溃循环就能无限重启（巡检 P2-19）。先试备份，
+        # 备份也读不到就按"预算已耗尽"处理，等人工 --reset-budget。
+        log(f"[WARN] keepalive 状态文件损坏: {e}")
+        try:
+            with open(STATE_BACKUP_FILE, "r", encoding="utf-8") as f:
+                st = json.load(f)
+            if isinstance(st, dict):
+                log("[WARN] 已从备份恢复 keepalive 状态")
+                return st
+        except Exception:
+            pass
+        log("[WARN] 状态文件与备份均不可用，暂按'限流已耗尽'处理"
+            "（人工介入后用 --reset-budget 解锁）")
+        return {"tdx_fail_count": 0, "restarts": [], "_state_broken": True}
     return {"tdx_fail_count": 0, "restarts": []}
 
 
 def save_state(st: dict) -> None:
+    """原子写：先写临时文件，再 os.replace 替换。
+
+    直接 open("w") 写一半崩溃（共享目录上更容易）会让 JSON 损坏，
+    而损坏被当成"空状态"= 限流归零（巡检 P2-19）。
+    """
+    tmp = STATE_FILE.parent / (STATE_FILE.name + ".tmp")
     try:
-        with open(STATE_FILE, "w", encoding="utf-8") as f:
+        with open(tmp, "w", encoding="utf-8") as f:
+            json.dump(st, f, ensure_ascii=False)
+            f.flush()
+            try:
+                os.fsync(f.fileno())
+            except OSError:
+                pass
+        os.replace(str(tmp), str(STATE_FILE))
+    except Exception as e:
+        log(f"[WARN] 写 keepalive 状态失败: {e}")
+        return
+    try:
+        with open(STATE_BACKUP_FILE, "w", encoding="utf-8") as f:
             json.dump(st, f, ensure_ascii=False)
     except Exception:
         pass
@@ -172,6 +210,9 @@ def restart_budget_ok(st: dict) -> bool:
       - 总量限制：1 小时内最多 MAX_RESTARTS_PER_HOUR 次 —— 防缓慢抖动
     """
     now = time.time()
+    if st.get("_state_broken"):
+        # 状态文件损坏 → 无法判断重启预算，保守起见不自愈（防无限重启循环）
+        return False
     restarts = [float(t) for t in st.get("restarts", [])]
     burst = [t for t in restarts if now - t < RESTART_BURST_WINDOW]
     hourly = [t for t in restarts if now - t < 3600]
@@ -188,8 +229,13 @@ def record_restart(st: dict) -> None:
 # ============================================================
 # 探活
 # ============================================================
-def dashboard_alive(port: int, host: str = "127.0.0.1", timeout: float = 5.0) -> bool:
-    """/api/health 可应答 = 看板活着（TCP connect 会漏判'进程僵死但 socket 残留'）"""
+def dashboard_alive(port: int, host: str = "127.0.0.1", timeout: float = 15.0) -> bool:
+    """/api/health 可应答 = 看板活着（TCP connect 会漏判'进程僵死但 socket 残留'）
+
+    超时给到 15s：/api/health 现在只读缓存（不再做实时 TQ 调用），
+    正常响应是几十毫秒；但看板正在提交 history/做 GC 时可能慢几秒，
+    原来 5s 太紧，容易把健康看板误判成"死了"（巡检 P2-22）。
+    """
     import urllib.request
     try:
         with urllib.request.urlopen(f"http://{host}:{port}/api/health", timeout=timeout) as r:
@@ -198,7 +244,7 @@ def dashboard_alive(port: int, host: str = "127.0.0.1", timeout: float = 5.0) ->
         return False
 
 
-def dashboard_health(port: int = DASHBOARD_PORT, timeout: float = 8.0) -> dict:
+def dashboard_health(port: int = DASHBOARD_PORT, timeout: float = 15.0) -> dict:
     """拿 /api/health 的 JSON；拿不到返回 {}"""
     import urllib.request
     try:
@@ -211,7 +257,12 @@ def dashboard_health(port: int = DASHBOARD_PORT, timeout: float = 8.0) -> dict:
 
 
 def tdx_pids() -> list:
-    """通达信进程 PID 列表"""
+    """通达信进程 PID 列表。
+
+    按行解析固定列，只取 PID 列 —— 原来把整段输出按空白切分后取"数字"，
+    可能把内存列的数值（如 "123456 K"）当成 PID，导致 taskkill 误杀无关进程
+    （巡检 P2-23）。
+    """
     try:
         r = subprocess.run(
             ["tasklist", "/FI", f"IMAGENAME eq {TDX_PROCESS}", "/NH"],
@@ -219,12 +270,31 @@ def tdx_pids() -> list:
         )
     except Exception:
         return []
-    out = r.stdout or ""
     pids = []
-    for tok in out.replace("\r", "").split():
-        if tok.isdigit() and int(tok) > 4:
-            pids.append(int(tok))
+    for line in (r.stdout or "").replace("\r", "").splitlines():
+        parts = line.split()
+        if len(parts) < 2:
+            continue
+        # 无表头输出格式: "TdxW.exe   10636 Console  1  100,000 K"
+        # 带表头时第一列是 "Image Name"
+        if parts[0].lower() in ("image", "image name", "映像名称", "进程名"):
+            continue
+        if parts[1].isdigit() and int(parts[1]) > 4:
+            pids.append(int(parts[1]))
     return pids
+
+
+def _process_cmdline(pid: int) -> str:
+    """取进程命令行（用于校验进程身份，避免误杀无关进程）"""
+    try:
+        r = subprocess.run(
+            ["powershell", "-NoProfile", "-Command",
+             f"(Get-CimInstance Win32_Process -Filter 'ProcessId={int(pid)}').CommandLine"],
+            capture_output=True, text=True, encoding="utf-8", errors="replace", timeout=15,
+        )
+        return (r.stdout or "").strip()
+    except Exception:
+        return ""
 
 
 def tdx_alive() -> bool:
@@ -243,26 +313,35 @@ def tdx_logged_in() -> bool:
     return False
 
 
-def kill_tdx_client() -> int:
-    """结束通达信客户端进程。
+def kill_tdx_client(st: dict) -> int:
+    """结束**自己拉起**的通达信客户端进程。
 
     用途：重置 TQ 的 mode 槽位。通达信每个 mode(0/1/2/3) 只有一个槽位，
     持有它的进程被强杀时槽位不会释放（实测：看板在 mode=2 被杀后，
     mode=2 的 init 直接返回"返回ID小于0"）——每重启一次看板就烧掉一个槽位，
     4 个烧光后 TQ 就再也起不来了。只有重启通达信客户端才能重置槽位。
+
+    **只杀自己拉起的那个 PID**（巡检 P1-18）：通达信是用户在看盘/下单的软件，
+    把用户正在用的会话强杀掉副作用很大。如果当前这个通达信不是本 watchdog
+    拉起来的（例如用户自己开的），就不杀，改为提示人工重启。
     """
-    killed = 0
-    for pid in tdx_pids():
-        try:
-            subprocess.run(
-                ["taskkill", "/PID", str(pid), "/F"],
-                capture_output=True, text=True, encoding="utf-8", errors="replace", timeout=15,
-            )
-            log(f"已结束通达信进程 PID={pid}")
-            killed += 1
-        except Exception as e:
-            log(f"结束通达信 PID={pid} 失败: {e}")
-    return killed
+    pid = st.get("tdx_pid")
+    if not pid:
+        log("[WARN] 当前通达信不是本 watchdog 拉起的，不执行强杀"
+            "（避免杀掉用户正在看盘/下单的会话）；"
+            "如需重置 TQ 槽位请人工重启通达信")
+        return 0
+    try:
+        subprocess.run(
+            ["taskkill", "/PID", str(int(pid)), "/F"],
+            capture_output=True, text=True, encoding="utf-8", errors="replace", timeout=15,
+        )
+        log(f"已结束通达信进程 PID={pid}")
+        st.pop("tdx_pid", None)
+        return 1
+    except Exception as e:
+        log(f"结束通达信 PID={pid} 失败: {e}")
+        return 0
 
 
 def tdx_slot_reset_allowed(st: dict) -> bool:
@@ -299,13 +378,22 @@ def port_listener_pids(port: int) -> set:
 
 
 def kill_port_listeners(port: int) -> int:
-    """干掉占用端口的残留进程（僵尸实例 / 不健康的旧实例）"""
+    """干掉占用端口的残留进程（僵尸实例 / 不健康的旧实例）。
+
+    杀之前**校验进程身份**：只杀命令行里确实是 stock_dashboard.py 的进程。
+    否则 8765 被别的程序占用时会误杀无关程序（巡检 P2-21）。
+    """
     killed = 0
     for pid in port_listener_pids(port):
+        cmdline = _process_cmdline(pid)
+        if "stock_dashboard.py" not in cmdline:
+            log(f"[WARN] PID={pid} 占用端口 {port} 但不是看板进程，跳过"
+                f"（命令行: {cmdline[:120]}）")
+            continue
         try:
             subprocess.run(["taskkill", "/PID", str(pid), "/F"],
                            capture_output=True, text=True, encoding="utf-8", errors="replace", timeout=15)
-            log(f"已结束端口 {port} 的残留进程 PID={pid}")
+            log(f"已结束端口 {port} 的残留看板进程 PID={pid}")
             killed += 1
         except Exception as e:
             log(f"结束 PID={pid} 失败: {e}")
@@ -418,12 +506,18 @@ def check_log_sizes(max_bytes: int = LOG_MAX_BYTES) -> None:
 # ============================================================
 # 启动
 # ============================================================
-def start_tdx_client(wait: int = 40) -> bool:
-    """拉起通达信客户端（GUI，弹在当前会话桌面）。进程出现即算成功。"""
+def start_tdx_client(wait: int = 40):
+    """拉起通达信客户端（GUI，弹在当前会话桌面）。进程出现即算成功。
+
+    返回 (ok, pid)：pid 是**新拉起**的那个进程。
+    只有自己拉起的进程才允许之后被 kill_tdx_client() 杀掉 ——
+    通达信是用户在看盘/下单的软件（巡检 P1-18）。
+    """
     exe = TDX_HOME / TDX_PROCESS
     if not exe.exists():
         log(f"通达信不存在: {exe}")
-        return False
+        return False, None
+    before = set(tdx_pids())
     try:
         subprocess.Popen(
             ["cmd", "/c", "start", "", str(exe)],
@@ -435,14 +529,17 @@ def start_tdx_client(wait: int = 40) -> bool:
         )
     except Exception as e:
         log(f"启动通达信失败: {e}")
-        return False
+        return False, None
     for i in range(max(1, wait // 2)):
         time.sleep(2)
-        if tdx_alive():
-            log(f"通达信已启动 (等待 {(i + 1) * 2}s)")
-            return True
+        now_pids = set(tdx_pids())
+        if now_pids:
+            new = now_pids - before
+            pid = sorted(new)[0] if new else sorted(now_pids)[0]
+            log(f"通达信已启动 (等待 {(i + 1) * 2}s) PID={pid}")
+            return True, pid
     log(f"通达信启动超时 ({wait}s)")
-    return False
+    return False, None
 
 
 def ensure_tdx_logged_in(wait: int = 90) -> bool:
@@ -548,18 +645,35 @@ def start_dashboard() -> None:
     )
 
 
-def start_dashboard_and_wait(timeout: int = 90) -> bool:
-    """拉起看板并轮询健康检查"""
+def start_dashboard_and_wait(st: dict = None, timeout: int = 90) -> bool:
+    """拉起看板并轮询健康检查。
+
+    拉起前在 state 里写"启动中"标记：keepalive 的锁只覆盖自身执行窗口，
+    不覆盖"锁释放 → 看板 bind 端口"这段空窗（进程起来要 ~20s）。
+    没有这个标记，第二个触发源落进空窗就会误判"看板死了"，
+    强杀刚拉起的实例 → 再烧一个 TQ 槽位（巡检 P0-7）。
+    """
+    if st is not None:
+        st["dashboard_starting_at"] = time.time()
+        save_state(st)
     start_dashboard()
+    ok = False
     for _ in range(max(1, timeout // 3)):
         time.sleep(3)
         if dashboard_alive(DASHBOARD_PORT):
             health = dashboard_health()
             state = health.get("tdx_health", "?")
             log(f"[OK] 看板已拉起 (port {DASHBOARD_PORT}, tdx_health={state})")
-            return True
-    log(f"[WARN] 看板已拉起，但 {timeout}s 内健康检查仍未通过 - 查 logs/dashboard.stdout.log")
-    return False
+            ok = True
+            break
+    if not ok:
+        log(f"[WARN] 看板已拉起，但 {timeout}s 内健康检查仍未通过 - 查 logs/dashboard.stdout.log")
+    if st is not None and ok:
+        # 只有**确认起来了**才清标记；起不来时保留标记 ——
+        # 窗口内不重复拉起，避免第二个触发源把刚拉起、还没 bind 端口的实例杀掉
+        st.pop("dashboard_starting_at", None)
+        save_state(st)
+    return ok
 
 
 # ============================================================
@@ -581,7 +695,28 @@ def main() -> int:
             log(f"看板正常 (port {DASHBOARD_PORT}, tdx_health=ok)", quiet=True)
             return 0  # 一切正常, 静默
 
-        # 活着但 TQ 异常
+        # busy=正在扫描(连接忙不是坏) / idle=非交易时段 / unknown=还没拉过第一轮
+        # —— 这些都不是故障，**不重启**（巡检 P1-1 的配套修复：
+        #   之前 /api/health 做实时 TQ 调用，扫描期间必然超时 → 误报 fail
+        #   → 连续 3 次后重启看板，这就是重启风暴的根因）
+        if tdx_state in ("busy", "idle", "unknown"):
+            if st.get("tdx_fail_count"):
+                st["tdx_fail_count"] = 0
+                st.pop("needs_tdx_restart", None)
+                save_state(st)
+            check_log_sizes()
+            log(f"看板正常 (port {DASHBOARD_PORT}, tdx_health={tdx_state})", quiet=True)
+            return 0
+
+        if tdx_state is None:
+            # 拿不到 tdx_health = tdx_client 模块不可用（TDX_OK=False）。
+            # 这不是"进程内 TQ 状态中毒"，重启看板完全无效（巡检 P1-19）——
+            # 原来会当成中毒一直重启到限流耗尽，看板全程拿不到 TQ 数据。
+            log("[WARN] 看板存活但 /api/health 没有 tdx_health —— "
+                "tdx_client 模块可能不可用；重启看板无效，等人工排查")
+            return 0
+
+        # 走到这里只剩 tdx_state == "fail"：TQ 真的连不上
         if not tdx_logged_in():
             # 通达信没登录 —— 重启看板没用（进程内 TQ 不是问题所在）
             log(f"[WARN] 看板存活但 tdx_health={tdx_state}；通达信未登录，"
@@ -608,9 +743,11 @@ def main() -> int:
             # 再烧一个（还起不来），此时该做的是重启通达信重置槽位
             if not tdx_tq_ready(timeout=40) and tdx_slot_reset_allowed(st):
                 log("[ACTION] TQ 探测失败（疑似 mode 槽位耗尽），先重启通达信重置槽位")
-                kill_tdx_client()
+                kill_tdx_client(st)
                 time.sleep(3)
-                start_tdx_client()
+                ok, pid = start_tdx_client()
+                if ok and pid:
+                    st["tdx_pid"] = pid
                 ensure_tdx_logged_in()
                 st.setdefault("tdx_restarts", []).append(time.time())
                 save_state(st)
@@ -621,11 +758,32 @@ def main() -> int:
             st["tdx_fail_count"] = 0
             save_state(st)
             time.sleep(2)
-            start_dashboard_and_wait()
+            start_dashboard_and_wait(st)
         return 0
 
-    # ---- 情况 2: 看板死了 ----
+    # ---- 情况 2: 看板没响应 ----
+    # 但要排除"上一轮刚拉起、还在启动窗口内"的情况：
+    # 看板进程起来到 bind 端口要 ~20s，这个窗口里第二次触发会误判"看板死了"
+    # → 强杀刚拉起的实例 → **再烧一个 TQ 槽位**（巡检 P0-7）。
+    # 启动窗口由 state 里的 dashboard_starting_at 记录。
+    starting_at = float(st.get("dashboard_starting_at") or 0)
+    if starting_at:
+        elapsed = time.time() - starting_at
+        if elapsed < DASHBOARD_STARTING_WINDOW:
+            log(f"看板正在启动中（{int(DASHBOARD_STARTING_WINDOW - elapsed)}s 后再判定），"
+                f"本次不重复拉起")
+            return 0
+        st.pop("dashboard_starting_at", None)
+        save_state(st)
+
     log(f"看板({DASHBOARD_PORT}) 未响应")
+
+    # **限流检查必须在所有破坏性动作之前**（巡检 P2-18）：
+    # 原来它排在"杀通达信 + 自动重登 + 重拉通达信"之后，
+    # 超限时通达信已经白重启一次，而看板反而再也不会被拉起。
+    if not restart_budget_ok(st):
+        log(f"[WARN] 重启次数超限({RESTART_BURST_WINDOW}s 内 {MAX_RESTARTS_BURST} 次 / 1h 内 {MAX_RESTARTS_PER_HOUR} 次)，放弃拉起，等人工介入")
+        return 0
 
     # 端口上可能还挂着不健康的僵尸实例，先清掉（活着就优雅退，退不掉再强杀）
     if stop_dashboard():
@@ -633,7 +791,10 @@ def main() -> int:
 
     if not tdx_alive():
         log("通达信未运行，尝试拉起")
-        start_tdx_client()
+        ok, pid = start_tdx_client()
+        if ok and pid:
+            st["tdx_pid"] = pid
+            save_state(st)
 
     # 通达信每次启动都停在登录框 —— 自动登录
     if not tdx_logged_in():
@@ -650,9 +811,11 @@ def main() -> int:
         # 只有重启通达信客户端才能重置槽位
         log("[ACTION] 通达信已登录但 TQ 探测失败，判定为 mode 槽位耗尽，"
             "重启通达信客户端重置槽位")
-        kill_tdx_client()
+        kill_tdx_client(st)
         time.sleep(3)
-        start_tdx_client()
+        ok, pid = start_tdx_client()
+        if ok and pid:
+            st["tdx_pid"] = pid
         ensure_tdx_logged_in()
         st.setdefault("tdx_restarts", []).append(time.time())
         save_state(st)
@@ -667,13 +830,14 @@ def main() -> int:
             "TQ 就绪后下一轮会重启看板以修复 TQ")
         st["needs_tdx_restart"] = True
 
-    if not restart_budget_ok(st):
-        log(f"[WARN] 重启次数超限({RESTART_BURST_WINDOW}s 内 {MAX_RESTARTS_BURST} 次 / 1h 内 {MAX_RESTARTS_PER_HOUR} 次)，放弃拉起，等人工介入")
-        return 0
-
-    record_restart(st)
-    save_state(st)
-    start_dashboard_and_wait()
+    started = start_dashboard_and_wait(st)
+    if started:
+        record_restart(st)
+        save_state(st)
+    else:
+        # 拉起失败（端口被占/启动异常）**不**占重启预算 ——
+        # 失败的尝试不该把预算吃光，否则看板彻底无人拉起（巡检 P3）
+        log("[WARN] 拉起未成功，不计入重启限流预算")
     return 0
 
 
@@ -681,16 +845,21 @@ if __name__ == "__main__":
     # 运维开关：--reset-budget 清空重启限流计数。
     # 人工重启（调试/升级）也会被记进崩溃自愈的预算里，连续几次之后
     # keepalive 就会以为在崩溃循环而拒绝拉起 —— 人工介入后用它解锁。
-    if "--reset-budget" in sys.argv:
-        st = load_state()
-        st["restarts"] = []
-        st["tdx_restarts"] = []
-        st["tdx_fail_count"] = 0
-        save_state(st)
-        log("[ACTION] 重启限流计数已清空")
+    #
+    # 注意：必须**先拿锁再改状态**（巡检 P2-19/P3）—— 原来在拿锁之前写，
+    # 会和正在运行的实例互相覆盖 state。
     if not acquire_lock():
         sys.exit(0)
     try:
+        if "--reset-budget" in sys.argv:
+            st = load_state()
+            st["restarts"] = []
+            st["tdx_restarts"] = []
+            st["tdx_fail_count"] = 0
+            st.pop("needs_tdx_restart", None)
+            st.pop("dashboard_starting_at", None)
+            save_state(st)
+            log("[ACTION] 重启限流计数已清空")
         sys.exit(main())
     finally:
         release_lock()

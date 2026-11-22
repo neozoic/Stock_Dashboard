@@ -227,6 +227,12 @@
     font-size: 10px; color: var(--muted); font-weight: normal;
     letter-spacing: 0; text-align: right;
   }
+  /* 图表口径说明：说明这张图"算的是什么"，避免把不同语义的曲线当成一回事 */
+  .chart .hint {
+    font-size: 10.5px; color: var(--muted); font-weight: normal;
+    letter-spacing: 0; margin: -6px 0 8px 10px; line-height: 1.5;
+  }
+  .chart .hint b { color: var(--text); font-weight: 600; }
   .card.chart { height: 320px; display: flex; flex-direction: column; }
   .card.chart > div { flex: 1; min-height: 0; }
   .card.chart.card-tall { height: 520px; }
@@ -392,6 +398,7 @@
   </div>
   <div class="card chart hero-market">
     <h2 class="accent-up">大盘资金净流入趋势 <span class="meta" id="market-meta">-</span></h2>
+    <p class="hint">口径：<b>全市场当日累计</b>净流入 —— 每轮刷新把当前净额累加进曲线；<b>仅交易时段有值</b>，休市日显示为空。</p>
     <div id="trend-market" class="chart-box"></div>
   </div>
 </section>
@@ -423,6 +430,7 @@
 <div class="sec-title">日线回看</div>
 <div class="card chart card-tall">
   <h2 class="accent-up">近 6 个交易日个股资金净流入 vs 流出 TOP 累计 <span class="meta" id="daily-top-meta">需累积约 6 个交易日数据;首次启动早期数据可能不足</span></h2>
+  <p class="hint">口径：<b>每个交易日收盘时的个股净额</b>（横轴 T-5…T 为交易日）—— 与下方"当日盘中累计曲线"不是一回事。</p>
   <div id="daily-top-chart" class="chart-box h-daily"></div>
   <div class="daily-tables">
     <div class="scroll scroll-h250">
@@ -438,16 +446,19 @@
 
 <div class="sec-title">盘中趋势</div>
 <div class="card chart">
-  <h2>个股净流入 TOP 趋势 <span class="meta">每 30s 一个点</span></h2>
+  <h2>个股净流入 TOP 趋势 <span class="meta">每 3 分钟一点（非交易时段每小时一点）</span></h2>
+  <p class="hint">口径：<b>当日盘中累计</b>（TOP 个股，每轮刷新一个点）；休市时段无数据。</p>
   <div id="trend-stock" class="chart-box h-trend"></div>
 </div>
 <div class="trend-pair">
   <div class="card chart">
     <h2>行业净流入 TOP 趋势</h2>
+    <p class="hint">口径：<b>当日盘中累计</b>（TOP 行业，每轮刷新一个点）。</p>
     <div id="trend-industry" class="chart-box h-trend"></div>
   </div>
   <div class="card chart">
     <h2>概念净流入 TOP 趋势</h2>
+    <p class="hint">口径：<b>当日盘中累计</b>（TOP 概念，每轮刷新一个点）。</p>
     <div id="trend-concept" class="chart-box h-trend"></div>
   </div>
 </div>
@@ -706,11 +717,23 @@ function hhmmssToMin(hhmmss) {
   return hh * 60 + mm + ss / 60 - (9 * 60 + 30);
 }
 
+// 墙钟时间 → 交易分钟坐标（X 轴 0=09:30 … 270=15:00，午休压缩成 30 格）。
+//
+// 返回 null = 该采样点不可用（盘前/盘后/超出 15:00），调用方应丢弃。
+//
+// 两个历史 bug（2026-11-22 前端审查 + 巡检实测）：
+// ① 下午段原来用 m-90 且把 13:00 归进午休段 —— 整个下午的采样点整体左移
+//    一格（13:00 画在"11:30"上、15:00 画在"14:30"上），x=270("15:00") 永远没数据。
+//    正确映射：13:00→150、15:00→270，即下午段用 m-60。
+// ② 盘后/周末的时间戳（如 23:08）映射到 700+，**跑出坐标轴域外** ——
+//    曲线被裁掉，表现为"有坐标轴、无曲线"，而且没有任何文字提示。
+//    现在直接返回 null，由调用方过滤并显示空状态。
 function toTradingMin(hhmmss) {
   const m = hhmmssToMin(hhmmss);
-  if (m <= 120) return m;
-  if (m <= 210) return 120;
-  return m - 90;
+  if (m < 0 || m > 330) return null;   // 早于 09:30 或晚于 15:00
+  if (m <= 120) return m;               // 上午 09:30-11:30 → 0..120
+  if (m < 210) return 120;              // 午休 11:30-13:00（压缩成 30 格，本就无数据）
+  return m - 60;                       // 下午 13:00-15:00 → 150..270
 }
 
 const TRADING_AXIS_BREAKS = [
@@ -767,13 +790,16 @@ function buildSeries(data, nameMap, timestamps) {
     const name = nameMap[key] || key;
     const values = data[key] || [];
     const lineColor = COLORS[i % COLORS.length];
-    const points = timestamps.map((t, idx) => {
+    const points = [];
+    timestamps.forEach((t, idx) => {
+      const x = toTradingMin(t);
+      if (x === null) return;          // 盘前/盘后/超出交易窗口 —— 丢弃
       const v = values[idx];
-      return {
+      points.push({
         name: t,
-        value: [toTradingMin(t), v],
+        value: [x, v],
         itemStyle: { color: v > 0 ? COLOR_UP : v < 0 ? COLOR_DOWN : COLOR_MUTED },
-      };
+      });
     });
     return {
       name,
@@ -896,12 +922,70 @@ const CHART_CURSOR_OPT = {
   },
 };
 
+// 空状态占位：把坐标轴也藏掉，只留一句说明。
+// （原来的占位只设 title，坐标轴还在 —— 看起来像"有坐标轴无曲线"）
+function chartPlaceholder(chart, text) {
+  _setChartOption(chart, {
+    title: { text: text, left: "center", top: "middle",
+      textStyle: { color: COLOR_MUTED, fontSize: 13 } },
+    xAxis: { show: false },
+    yAxis: { show: false },
+    series: [],
+  });
+}
+
+// 这批时间点里有没有"画得出来"的数据。
+//
+// 关键：X 轴是**固定的交易分钟刻度**（09:30→0 … 15:00→270），
+// 而趋势时间戳是"拉数时刻"的墙钟时间。休市时（如 23:30）映射到 700+，
+// 跑到坐标轴范围外 —— 于是"有坐标轴、无曲线"。
+// 所以只要所有点都落在交易窗口外，就该显示空状态而不是空坐标轴。
+function hasPlottablePoints(timestamps, valueLists) {
+  if (!timestamps || !timestamps.length) return false;
+  for (let i = 0; i < timestamps.length; i++) {
+    const x = toTradingMin(timestamps[i]);
+    if (x === null) continue;            // 不在 09:30-15:00 窗口内
+    for (const vals of valueLists) {
+      const v = vals && vals[i];
+      if (v != null && !isNaN(v)) return true;
+    }
+  }
+  return false;
+}
+
+// tooltip 追加一行"口径说明"
+function tooltipWithNote(base, note) {
+  return function (params) {
+    const body = base(params);
+    if (!body) return body || "";
+    return body
+      + '<div style="margin-top:6px;padding-top:6px;border-top:1px solid rgba(255,255,255,.12);'
+      + 'color:' + COLOR_MUTED + ';font-size:11px;white-space:normal">口径：' + note + "</div>";
+  };
+}
+
+const NOTE_INTRADAY_CUM = "当日盘中累计净额（每轮刷新一个点，仅交易时段有值）";
+const NOTE_MARKET_CUM = "全市场当日累计净流入（每轮刷新累加，仅交易时段有值）";
+
+// 当前是否处于交易时段（由 /api/data 的 is_trading 更新）。
+// null=还不知道；用于区分"休市所以没数据"和"刚启动还在攒数据"。
+let marketIsTrading = null;
+
+// 空状态文案：休市 vs 攒数据，语义不同，不能一律写"等待第二次刷新"
+function intradayEmptyText() {
+  if (marketIsTrading === false) return "休市 / 非交易时段：暂无当日分时数据";
+  if (marketIsTrading === true) return "数据积累中（至少需要 2 个采样点）";
+  return "暂无分时数据";
+}
+
 function renderTrendSeries(chart, timestamps, dataDict, nameMap) {
   if (!timestamps || timestamps.length === 0) {
-    _setChartOption(chart, {
-      title: { text: "暂无趋势数据 (等待第二次刷新)", left: "center", top: "middle",
-        textStyle: { color: COLOR_MUTED, fontSize: 13 } },
-    });
+    chartPlaceholder(chart, intradayEmptyText());
+    return;
+  }
+  const valueLists = Object.keys(dataDict).map(k => dataDict[k]);
+  if (!hasPlottablePoints(timestamps, valueLists)) {
+    chartPlaceholder(chart, intradayEmptyText());
     return;
   }
   const series = buildSeries(dataDict, nameMap, timestamps);
@@ -912,32 +996,49 @@ function renderTrendSeries(chart, timestamps, dataDict, nameMap) {
     ...CHART_CURSOR_OPT,
     tooltip: {
       ...CHART_CURSOR_OPT.tooltip,
-      formatter: TREND_TOOLTIP_FORMATTER,
+      formatter: tooltipWithNote(TREND_TOOLTIP_FORMATTER, NOTE_INTRADAY_CUM),
     },
     axisPointer: CHART_CURSOR_OPT.axisPointer,
     legend: { textStyle: { color: "#c6cdd9", fontSize: 11 }, top: 0, type: "scroll",
       pageIconColor: COLOR_MUTED, pageTextStyle: { color: COLOR_MUTED } },
     grid: { left: 56, right: 24, top: 36, bottom: 56 },
-    xAxis: TRADING_X_AXIS,
-    yAxis: netYAxis("净额(亿)"),
+    xAxis: { ...TRADING_X_AXIS, show: true },
+    yAxis: { ...netYAxis("净额(亿)"), show: true },
     series,
   });
 }
 
 function renderMarketTrend(chart, timestamps, market) {
   if (!timestamps || timestamps.length === 0) {
-    _setChartOption(chart, {
-      title: { text: "暂无大盘数据", left: "center", top: "middle",
-        textStyle: { color: COLOR_MUTED, fontSize: 13 } },
-    });
+    chartPlaceholder(chart, intradayEmptyText());
     return;
   }
-  const cur = market.length > 0 ? market[market.length - 1] : 0;
-  const min = Math.min(...market);
-  const max = Math.max(...market);
+  // 过滤掉交易窗口外的采样点（休市/盘后的时间戳会映射到坐标轴域外）
+  const points = [];
+  (timestamps || []).forEach((t, idx) => {
+    const x = toTradingMin(t);
+    if (x === null) return;
+    const v = market[idx];
+    if (v == null || isNaN(v)) return;
+    points.push([x, v]);
+  });
+  if (points.length === 0) {
+    // 原来这里只判 timestamps 是否为空 —— 而服务器在休市时照样返回
+    // 非空 timestamps（23:08:36 这种），于是走到"画折线"分支，
+    // 所有点都在轴域外 → "有坐标轴、无曲线"且没有任何提示。
+    chartPlaceholder(chart, intradayEmptyText());
+    return;
+  }
+  if (points.length < 2) {
+    chartPlaceholder(chart, "数据积累中（至少需要 2 个采样点）");
+    return;
+  }
+  const vals = points.map(p => p[1]);
+  const cur = vals.length > 0 ? vals[vals.length - 1] : 0;
+  const min = Math.min(...vals);
+  const max = Math.max(...vals);
   const lineColor = cur >= 0 ? COLOR_UP : COLOR_DOWN;
   const areaTopColor = cur >= 0 ? hexA(COLOR_UP, 0.35) : hexA(COLOR_DOWN, 0.35);
-  const points = timestamps.map((t, idx) => [toTradingMin(t), market[idx]]);
   _setChartOption(chart, {
     title: { text: "" },  // 清掉"暂无大盘数据"占位
     backgroundColor: "transparent",
@@ -945,12 +1046,12 @@ function renderMarketTrend(chart, timestamps, market) {
     ...CHART_CURSOR_OPT,
     tooltip: {
       ...CHART_CURSOR_OPT.tooltip,
-      formatter: TREND_TOOLTIP_FORMATTER,
+      formatter: tooltipWithNote(TREND_TOOLTIP_FORMATTER, NOTE_MARKET_CUM),
     },
     axisPointer: CHART_CURSOR_OPT.axisPointer,
     grid: { left: 56, right: 24, top: 20, bottom: 56 },
-    xAxis: TRADING_X_AXIS,
-    yAxis: netYAxis("净流入(亿)"),
+    xAxis: { ...TRADING_X_AXIS, show: true },
+    yAxis: { ...netYAxis("净流入(亿)"), show: true },
     series: [{
       name: "大盘净流入",
       type: "line",
@@ -1026,12 +1127,22 @@ function updateMarketKpi(marketNet) {
 }
 
 let countdown = 10;
+// 请求序号守卫（防旧响应覆盖新响应）
+let dataReqSeq = 0;
+let trendReqSeq = 0;
 
 async function fetchData() {
+  // 请求序号守卫：后端 /api/data 阻塞时，10s 心跳不 await 就发下一次 ——
+  // 旧响应后到会覆盖新数据，表格/KPI 回退到旧快照
+  // （与分钟线的 minuteReqSeq 同一套路）
+  const seq = ++dataReqSeq;
   try {
     const r = await fetch("/api/data", { cache: "no-store" });
     if (!r.ok) throw new Error("HTTP " + r.status);
     const d = await r.json();
+    if (seq !== dataReqSeq) return;   // 已有更新的请求在飞，丢弃本次响应
+    // 记录当前是否处于交易时段 —— 空状态文案要区分"休市"和"还在攒数据"
+    if (typeof d.is_trading === "boolean") marketIsTrading = d.is_trading;
 
     let source = "live";
     let dataDate = (d.timestamp || "").slice(0, 10);
@@ -1304,10 +1415,12 @@ async function fetchPeriodData() {
 }
 
 async function fetchTrend() {
+  const seq = ++trendReqSeq;
   try {
     const r = await fetch("/api/trend", { cache: "no-store" });
     if (!r.ok) return;
     const d = await r.json();
+    if (seq !== trendReqSeq) return;   // 已有更新的请求在飞，丢弃本次响应
     const ts = d.timestamps || [];
     const names = d.names || {};
     renderTrendSeries(charts.stock, ts, d.stock || {}, names.stock || {});
@@ -1334,6 +1447,10 @@ function setMinuteMsg(text, isErr) {
 }
 
 function minutePlaceholder(text) {
+  // 注意：这里把坐标轴藏了，而后续 renderMinuteChart 走的是 **merge** 模式 ——
+  // merge 不会删除"上一版有、这一版没写"的键，所以 yAxis[0].show=false 会
+  // **永久残留**，导致分钟线图的"价格"轴再也不显示（前端审查 P1）。
+  // 因此 renderMinuteChart 里必须显式写回 show:true（见下）。
   _setChartOption(charts.minute, {
     title: { text, left: "center", top: "middle",
       textStyle: { color: COLOR_MUTED, fontSize: 13 } },
@@ -1378,11 +1495,13 @@ function renderMinuteChart(payload) {
         axisLine: { lineStyle: { color: AXIS_LINE } } },
     ],
     yAxis: [
-      { scale: true, gridIndex: 0, name: "价格",
+      // show:true 必须显式写 —— minutePlaceholder 置过 yAxis.show=false，
+      // merge 模式不会自动删键（前端审查 P1：价格轴永久消失）
+      { show: true, scale: true, gridIndex: 0, name: "价格",
         nameTextStyle: { color: COLOR_MUTED, fontSize: 10 },
         axisLabel: { color: COLOR_MUTED, fontSize: 10 },
         splitLine: { lineStyle: { color: SPLIT_LINE } } },
-      { scale: true, gridIndex: 1, name: "量",
+      { show: true, scale: true, gridIndex: 1, name: "量",
         nameTextStyle: { color: COLOR_MUTED, fontSize: 10 },
         axisLabel: { color: COLOR_MUTED, fontSize: 10 },
         splitLine: { show: false } },
@@ -1694,6 +1813,21 @@ setInterval(() => {
   }
   document.getElementById("next").textContent = countdown + "s";
 }, 1000);
+
+// 标签页可见性：后台标签的 setInterval 会被浏览器节流到 ~1/min，
+// 计时器计数会漂移（"下次刷新 9s" 其实过了 10 分钟），
+// 回到页面时数据已经很旧。切回来立刻补一次刷新并重置倒计时。
+document.addEventListener("visibilitychange", () => {
+  if (document.visibilityState === "visible") {
+    countdown = 10;
+    fetchData();
+    fetchTrend();
+    if (lastMinuteQuery) fetchMinute();
+    updateClocks();
+    updateOpenCountdown();
+    updateTradingStates();
+  }
+});
 
 window.addEventListener("resize", () => {
   if (window._resizeRaf) return;

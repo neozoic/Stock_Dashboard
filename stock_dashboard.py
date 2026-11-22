@@ -200,8 +200,36 @@ except Exception:
     AK_OK = False
 
 
+# ============================================================
+# HTTP 安全（均为**可选**，默认关闭以免打断现有调用与前端）
+# ============================================================
+# DASHBOARD_TOKEN：设置后，所有 /api/* 需要 `Authorization: Bearer <token>`。
+# 不设置 = 完全不鉴权（保持现有行为）。用于把看板暴露到局域网/公网时兜底。
+API_TOKEN = os.environ.get("DASHBOARD_TOKEN", "").strip()
+# DASHBOARD_CORS_ORIGIN：默认**不发** CORS 头（同源即可）。
+# 原来固定发 `Access-Control-Allow-Origin: *` —— 任意外部页面都能跨域读本机
+# 看板数据（2026-11-22 巡检 P2-25）。确有跨域需求时显式指定来源。
+CORS_ORIGIN = os.environ.get("DASHBOARD_CORS_ORIGIN", "").strip()
+
 DATA_LOCK = threading.Lock()
 FETCH_LOCK = threading.Lock()
+
+# TQ 连接状态缓存 —— /api/health 只读它，**不做实时 TQ 调用**。
+# 原因（2026-11-22 巡检 P1-1，重启风暴根因）：原来的 health_check 是带 3s
+# 超时的实时 TQ 调用，而全市场扫描期间 TQ 必然忙 → 3s 必然超时 → 把健康看板
+# 误报成 tdx_health=fail → keepalive 连续 3 次后重启看板 → 再烧一个 TQ 槽位。
+# 取值：ok / fail(真故障) / busy(正在扫描) / idle(非交易时段) / unknown(还没拉过)
+TDX_HEALTH = {"state": "unknown", "updated": 0.0, "error": None, "ts": None}
+
+
+def _set_tdx_health(state: str, error=None) -> None:
+    """更新 TQ 状态缓存（只有后台拉数线程写，/api/health 只读）。"""
+    TDX_HEALTH["state"] = state
+    TDX_HEALTH["updated"] = time.time()
+    TDX_HEALTH["error"] = error
+    TDX_HEALTH["ts"] = bj_now_naive().strftime("%Y-%m-%d %H:%M:%S")
+
+
 LATEST = {
     "timestamp": None,
     "stock_top": [],
@@ -927,34 +955,16 @@ def _commit_snapshot_and_history(snapshot):
         return False
 
     now_ts = bj_now_naive().strftime("%H:%M:%S")
+    # 非交易时段**不写 history**（前端审查 P1）：
+    #   ① 休市时的墙钟时间（如 23:08）映射到 X 轴域外 → 曲线被裁掉，
+    #      表现为"有坐标轴、无曲线"；
+    #   ② history 的 timestamps 从不按日重置，周一的点和周二的点会落在同一批
+    #      时钟刻度上，折线在 x=240→0 之间来回跳，看着像日内剧烈波动。
+    # 榜单/KPI 仍然照常更新（休市时页面照常有数据），只是不污染分时曲线。
+    in_session = in_trading_hours()
+    if not in_session:
+        logger.debug("[hist] 非交易时段，跳过 history 追加（避免跨日/出域采样点）")
     with DATA_LOCK:
-        # ---- history 追加（一次性提交）----
-        hist = LATEST["history"]
-        hist["timestamps"].append(now_ts)
-        if len(hist["timestamps"]) > HISTORY_MAX:
-            del hist["timestamps"][:len(hist["timestamps"]) - HISTORY_MAX]
-        n_ts = len(hist["timestamps"]) - 1
-
-        def _push_group(group_key, rows, name_field, limit):
-            """追加一组 series：在榜的写值，掉榜的旧 key 补 None 保持与 timestamps 对齐。"""
-            target = hist[group_key]
-            seen = set()
-            for r in rows[:limit]:
-                name = str(r.get(name_field, ""))
-                if not name:
-                    continue
-                if name not in target:
-                    target[name] = [None] * n_ts  # 新 series 预填历史空位
-                _push_series(target, name, parse_money_to_yi(r.get("净额")), _SERIES_ZERO_STREAK)
-                seen.add(name)
-            for name in list(target.keys()):
-                if name not in seen:
-                    _push_series(target, name, None, _SERIES_ZERO_STREAK)
-
-        _push_group("industry", snapshot.get("industry_top", []), "行业", IND_TOP_N)
-        _push_group("stock", snapshot.get("stock_top", []), "股票代码", STOCK_TOP_N)
-        _push_group("concept", snapshot.get("concept_top", []), "行业", CONCEPT_TOP_N)
-
         # market_net：top/bottom 在板块总数较少时可能重叠，按行业名去重后求和
         seen_ind = set()
         market_net = 0.0
@@ -964,10 +974,40 @@ def _commit_snapshot_and_history(snapshot):
                 continue
             seen_ind.add(nm)
             market_net += parse_money_to_yi(r.get("净额"))
-        hist["market"].append(round(market_net, 2))
-        if len(hist["market"]) > HISTORY_MAX:
-            del hist["market"][:len(hist["market"]) - HISTORY_MAX]
-        LATEST["market_net"] = round(market_net, 2)
+        market_net = round(market_net, 2)
+        LATEST["market_net"] = market_net
+
+        if in_session:
+            # ---- history 追加（一次性提交）----
+            hist = LATEST["history"]
+            hist["timestamps"].append(now_ts)
+            if len(hist["timestamps"]) > HISTORY_MAX:
+                del hist["timestamps"][:len(hist["timestamps"]) - HISTORY_MAX]
+            n_ts = len(hist["timestamps"]) - 1
+
+            def _push_group(group_key, rows, name_field, limit):
+                """追加一组 series：在榜的写值，掉榜的旧 key 补 None 保持与 timestamps 对齐。"""
+                target = hist[group_key]
+                seen = set()
+                for r in rows[:limit]:
+                    name = str(r.get(name_field, ""))
+                    if not name:
+                        continue
+                    if name not in target:
+                        target[name] = [None] * n_ts  # 新 series 预填历史空位
+                    _push_series(target, name, parse_money_to_yi(r.get("净额")), _SERIES_ZERO_STREAK)
+                    seen.add(name)
+                for name in list(target.keys()):
+                    if name not in seen:
+                        _push_series(target, name, None, _SERIES_ZERO_STREAK)
+
+            _push_group("industry", snapshot.get("industry_top", []), "行业", IND_TOP_N)
+            _push_group("stock", snapshot.get("stock_top", []), "股票代码", STOCK_TOP_N)
+            _push_group("concept", snapshot.get("concept_top", []), "行业", CONCEPT_TOP_N)
+
+            hist["market"].append(market_net)
+            if len(hist["market"]) > HISTORY_MAX:
+                del hist["market"][:len(hist["market"]) - HISTORY_MAX]
 
         # ---- LATEST 替换（同一锁内，紧跟 history）----
         for k in ("timestamp", "stock_top", "stock_bottom", "industry_top", "industry_bottom",
@@ -1014,6 +1054,14 @@ def fetch_once():
             elif not tdx_used:
                 snapshot["source"] = "akshare" if akshare_ok else "tdx"
 
+        # === 更新 TQ 状态缓存（/api/health 只读它，不做实时 TQ 调用）===
+        # tdx_used=True 即表示 TQ 连接可用 —— 资金流全 0 是 level-1 客户端的
+        # 限制（不下发分类数据），不是连接故障，不能报 fail。
+        if tdx_used:
+            _set_tdx_health("ok")
+        else:
+            _set_tdx_health("fail", error="TDX 未取到数据，已走 akshare 兜底")
+
         # === 阶段 2+3：history 累积 + LATEST 替换，单 DATA_LOCK 内原子提交 ===
         _commit_snapshot_and_history(snapshot)
 
@@ -1030,38 +1078,55 @@ def background_loop(interval=60, stop_event=None):
     # 超时可辨识哨兵：fetch_once 正常返回也是 None，
     # 用 default=None 会把每一轮都误判为超时（历史上"连续 N 轮超时"全为此假阳性）
     fetch_timeout = object()
-    consecutive_timeouts = 0
+    # 两个计数器必须分开（巡检 P1-7）：
+    #   real_timeouts  = 本轮拉数**真的**超时了 → 才允许强制重建连接
+    #   skipped_rounds = 只是因为上一轮的僵尸线程占着 FETCH_LOCK 而跳过本轮（不是超时）
+    # 之前共用一个计数器，导致"仅因上一轮超时"就触发 init(force=True) 强断 TQ ——
+    # 而旧线程还在用这条连接时重建连接，正是通达信客户端崩溃的诱因。
+    real_timeouts = 0
+    skipped_rounds = 0
     while not stop_event.is_set():
-        if consecutive_timeouts > 0 and TDX_OK:
-            # 上一轮 hang 过：旧连接可能已僵死，强制重连（init 本身也包超时，防止卡在这里）
-            logger.warning("[bg] 连续 %d 轮超时，强制重建 TDX 连接", consecutive_timeouts)
+        # 非交易时段降频：收盘后仍每 180s 扫全市场 5000+ 只是白烧 TQ 带宽，
+        # 还会拉长 hang 窗口（巡检 P1-6）。改成 1 小时一轮，页面数据照样有
+        # （TDX 主拉只要 ~20s），但不再持续压 TQ。
+        in_session = in_trading_hours()
+        wait_s = interval if in_session else max(interval, OFFHOURS_FETCH_INTERVAL)
+        if real_timeouts > 0 and TDX_OK:
+            # 上一轮真的 hang 过：旧连接可能已僵死，强制重连（init 本身也包超时，防止卡在这里）
+            logger.warning("[bg] 连续 %d 轮超时，强制重建 TDX 连接", real_timeouts)
             ok = _call_with_timeout(lambda: tdx_client.init(force=True), timeout=30, default=False,
                                     label="background_loop.init(force=True)")
             logger.warning("[bg] TDX 强制重连%s", "成功" if ok else "失败")
         # 上一轮若 watchdog 超时，僵尸 fetch 线程可能仍持有 FETCH_LOCK——
         # 此时再跑一轮必然再次超时（连锁超时死循环）。探测到占用则跳过本轮。
         if not FETCH_LOCK.acquire(blocking=False):
-            consecutive_timeouts += 1
-            logger.warning("[bg] FETCH_LOCK 仍被上一轮占用，跳过本轮（连续 %d 轮）", consecutive_timeouts)
-            if stop_event.wait(timeout=interval):
+            skipped_rounds += 1
+            _set_tdx_health("busy", error="上一轮拉数仍在进行中")
+            logger.warning("[bg] FETCH_LOCK 仍被上一轮占用，跳过本轮（连续 %d 轮跳过）", skipped_rounds)
+            if stop_event.wait(timeout=wait_s):
                 break
             continue
         FETCH_LOCK.release()
         # 整轮 watchdog：fetch_once 在 daemon 线程里跑，超时则放弃本轮（保留 LATEST 旧值）
         watchdog = _call_with_timeout(fetch_once, timeout=interval - 5, default=fetch_timeout, label="background_loop.fetch_once")
         if watchdog is fetch_timeout:
-            consecutive_timeouts += 1
-            logger.warning("[bg] 本轮拉数超过 %ds watchdog 超时（连续 %d 轮）", interval - 5, consecutive_timeouts)
+            real_timeouts += 1
+            _set_tdx_health("busy", error="本轮拉数超过 watchdog 时限")
+            logger.warning("[bg] 本轮拉数超过 %ds watchdog 超时（连续 %d 轮）", interval - 5, real_timeouts)
         else:
-            consecutive_timeouts = 0
+            real_timeouts = 0
         # 间隔睡眠，但能被 stop_event 立即唤醒
-        if stop_event.wait(timeout=interval):
+        if stop_event.wait(timeout=wait_s):
             break
     print("[bg] stopped", flush=True)
 
 
 # 后台线程：每 600s 拉一次近 N 日累计（akshare 接口，慢）
 PERIOD_FETCH_INTERVAL = 600  # 10 分钟
+
+# 非交易时段的全市场拉取间隔（秒）。收盘后没必要每 180s 扫 5000+ 只：
+# 白烧 TQ 带宽，还拉长 hang 窗口（2026-11-22 巡检 P1-6）。
+OFFHOURS_FETCH_INTERVAL = 3600  # 1 小时
 
 
 def period_background_loop(interval=PERIOD_FETCH_INTERVAL, stop_event=None):
@@ -1225,7 +1290,12 @@ class Handler(BaseHTTPRequestHandler):
             self.send_response(status)
             self.send_header("Content-Type", "application/json; charset=utf-8")
             self.send_header("Content-Length", str(len(data)))
-            self.send_header("Access-Control-Allow-Origin", "*")
+            # CORS 默认不发（同源即可）。原来固定 "*" —— 任意外部页面都能跨域
+            # 读本机看板数据（巡检 P2-25）。确有跨域需求时用
+            # DASHBOARD_CORS_ORIGIN 显式指定来源。
+            if CORS_ORIGIN:
+                self.send_header("Access-Control-Allow-Origin", CORS_ORIGIN)
+                self.send_header("Vary", "Origin")
             self.send_header("Cache-Control", "no-store")
             if extra_headers:
                 for k, v in extra_headers.items():
@@ -1245,37 +1315,66 @@ class Handler(BaseHTTPRequestHandler):
         else:
             self.send_error(404)
 
+    def _auth_ok(self) -> bool:
+        """可选的 Bearer token 鉴权。
+
+        DASHBOARD_TOKEN 未设置（默认）→ 完全不鉴权，不打断现有调用与前端；
+        设置后 → /api/* 必须带 `Authorization: Bearer <token>`。
+        用 hmac.compare_digest 做常数时间比较，避免时序侧信道。
+        """
+        if not API_TOKEN:
+            return True
+        hdr = self.headers.get("Authorization", "") or ""
+        if not hdr.startswith("Bearer "):
+            return False
+        import hmac
+        return hmac.compare_digest(hdr[7:].strip(), API_TOKEN)
+
     def do_GET(self):
-        if self.path == "/" or self.path == "/index.html":
+        # 路由匹配前先剥掉 query string —— 否则 "/api/data?t=1" 会被当成
+        # 未知路径（非白名单静态文件）直接 404，前端加个 cache-buster
+        # 就整页取不到数据（2026-11-22 巡检 P1-3，实测 /api/data?t=1 → 404）
+        from urllib.parse import urlsplit
+        route = urlsplit(self.path).path
+        # 可选鉴权：只保护 /api/*（静态页面本身不含数据）
+        if route.startswith("/api/") and not self._auth_ok():
+            self._send_json_response(
+                401,
+                {"ok": False, "code": 401, "error": "unauthorized",
+                 "message": "需要 Authorization: Bearer <token>"},
+                extra_headers={"WWW-Authenticate": "Bearer"},
+            )
+            return
+        if route == "/" or route == "/index.html":
             self._serve_file("dashboard.html", "text/html; charset=utf-8")
-        elif self.path == "/api/data":
+        elif route == "/api/data":
             self._serve_json()
-        elif self.path == "/api/history":
+        elif route == "/api/history":
             self._serve_history()
-        elif self.path == "/api/trend":
+        elif route == "/api/trend":
             self._serve_trend()
-        elif self.path == "/api/health":
+        elif route == "/api/health":
             self._serve_health()
-        elif self.path == "/api/alerts":
+        elif route == "/api/alerts":
             self._serve_alerts()
-        elif self.path.startswith("/api/minute"):
+        elif route.startswith("/api/minute"):
             self._serve_minute()
-        elif self.path.startswith("/api/indicator"):
+        elif route.startswith("/api/indicator"):
             self._serve_indicator()
-        elif self.path.startswith("/api/data/period_compare"):
+        elif route.startswith("/api/data/period_compare"):
             self._serve_period_compare()
-        elif self.path.startswith("/api/data/daily_top"):
+        elif route.startswith("/api/data/daily_top"):
             self._serve_daily_top()
-        elif self.path.startswith("/api/data/latest"):
+        elif route.startswith("/api/data/latest"):
             self._serve_latest_snapshot()
-        elif self.path.startswith("/api/data/period"):
+        elif route.startswith("/api/data/period"):
             self._serve_period()
         else:
             # 兜底：仅放行显式白名单内的静态文件（前端实际需要的资源）。
             # 任何 dotfile（.env/.git/...）、源码、未列名文件一律 404，
             # 防止 0.0.0.0 绑定时被局域网任意文件读。
             from urllib.parse import unquote
-            name = unquote(self.path.lstrip("/"))
+            name = unquote(route.lstrip("/"))
             _STATIC_WHITELIST = {
                 "dashboard.html": "text/html; charset=utf-8",
                 "index.html": "text/html; charset=utf-8",
@@ -1336,8 +1435,11 @@ class Handler(BaseHTTPRequestHandler):
         try:
             bars = tdx_client.get_minute_bars([code], period=period, count=count)
         except Exception as e:
+            # 细节只写日志，不回显给客户端 —— 异常原文里含本机路径/DLL 细节
+            # （巡检 P2-5）
+            logger.warning("get_minute_bars 异常: %s", e)
             self._send_json_response(503, {"ok": False, "code": 503, "error": "tdx_error",
-                                           "message": f"get_minute_bars 异常: {e}"})
+                                           "message": "分时数据获取失败"})
             return
         if bars is None:
             self._send_json_response(503, {"ok": False, "code": 503, "error": "tdx_unavailable",
@@ -1396,8 +1498,10 @@ class Handler(BaseHTTPRequestHandler):
                                            "message": str(e)})
             return
         except Exception as e:
+            # 细节只写日志，不回显给客户端（巡检 P2-5）
+            logger.warning("get_formula_indicator 异常: %s", e)
             self._send_json_response(503, {"ok": False, "code": 503, "error": "tdx_error",
-                                           "message": f"get_formula_indicator 异常: {e}"})
+                                           "message": "指标计算失败"})
             return
         if result is None:
             self._send_json_response(503, {"ok": False, "code": 503, "error": "tdx_unavailable",
@@ -1519,20 +1623,47 @@ class Handler(BaseHTTPRequestHandler):
     def _serve_file(self, name, ctype):
         path = os.path.join(os.path.dirname(os.path.abspath(__file__)), name)
         try:
+            st = os.stat(path)
+        except FileNotFoundError:
+            # 白名单里有但磁盘上没有（例如 favicon.ico）—— 回 404。
+            # 注意 FileNotFoundError 是 OSError 的子类，必须排在 OSError 之前：
+            # 原来顺序反了，异常被 OSError 吞掉后**一个响应都不发**就断连
+            # （2026-11-22 巡检 P1-4，实测 /favicon.ico → RemoteDisconnected）
+            self._send_not_found()
+            return
+        except OSError as e:
+            logger.warning("stat file failed (%s): %s", name, e)
+            self._send_not_found()
+            return
+
+        # ETag/304：静态资源（echarts.min.js 有 1MB）每次全量重传太浪费。
+        # HTML 用 no-store（改了必须立刻生效），其余用 no-cache + ETag
+        # （浏览器每次带 If-None-Match 来问，未变就回 304）。
+        etag = '"%x-%x"' % (int(st.st_mtime), st.st_size)
+        if self.headers.get("If-None-Match") == etag:
+            self.send_response(304)
+            self.send_header("ETag", etag)
+            self.send_header("Cache-Control", "no-cache")
+            self.end_headers()
+            return
+
+        try:
             with open(path, "rb") as f:
                 data = f.read()
             self.send_response(200)
             self.send_header("Content-Type", ctype)
             self.send_header("Content-Length", str(len(data)))
-            self.send_header("Cache-Control", "no-store")
+            self.send_header("ETag", etag)
+            self.send_header("Cache-Control",
+                             "no-store" if ctype.startswith("text/html") else "no-cache")
             self.end_headers()
             self.wfile.write(data)
         except (BrokenPipeError, ConnectionResetError):
             logger.debug("client disconnected during file response: %s", name)
-        except OSError as e:
-            logger.warning("send file failed (%s): %s", name, e)
         except FileNotFoundError:
             self._send_not_found()
+        except OSError as e:
+            logger.warning("send file failed (%s): %s", name, e)
 
     def _serve_json(self):
         # 锁内只读拷贝 dict（list 是共享引用可接受，因为只读不写）
@@ -1608,12 +1739,13 @@ class Handler(BaseHTTPRequestHandler):
             "last_error": LATEST["error"],
         }
         if TDX_OK:
-            try:
-                # tdx_client.health_check 是阻塞调用：包超时防止 /api/health 雪崩
-                fut_health = _call_with_timeout(tdx_client.health_check, timeout=3.0, default=False)
-                health["tdx_health"] = "ok" if fut_health else "fail"
-            except Exception as e:
-                health["tdx_health"] = f"error: {e}"
+            # 只读缓存，**不做实时 TQ 调用**。
+            # 原来的实时 health_check 带 3s 超时，而全市场扫描期间 TQ 必然忙
+            # → 必然超时 → 把健康看板误报成 fail → keepalive 连续 3 次后重启
+            # → 再烧一个 TQ 槽位。这是 2026-11-22 重启风暴的根因（巡检 P1-1）。
+            health["tdx_health"] = TDX_HEALTH.get("state", "unknown")
+            if TDX_HEALTH.get("error"):
+                health["tdx_health_error"] = str(TDX_HEALTH["error"])[:200]
         self._send_json_response(200, health)
 
     def _serve_alerts(self):
@@ -1628,26 +1760,31 @@ class Handler(BaseHTTPRequestHandler):
                 "full_watchlist_size": len(m._full_watchlist),
                 "hot_watchlist_size": len(m._hot_watchlist),
                 "subscribed_size": len(m._subscribed),
-                "alerts_sent": m.stats['alerts_sent'],
-                "warn_sent": m.stats.get('warn_sent', 0),
-                "events_received": m.stats['events_received'],
-                "scans_done": m.stats['scans_done'],
-                "started_at": m.stats['started_at'],
-                "scan_interval_sec": m.scan_interval_sec,
+                # 一律用 .get()：stats 由后台线程并发改，硬索引遇到键缺失会抛
+                # KeyError 冒泡到 handle_one_request —— 客户端收到空连接（巡检 P2-4）
+                "alerts_sent": m.stats.get("alerts_sent", 0),
+                "warn_sent": m.stats.get("warn_sent", 0),
+                "events_received": m.stats.get("events_received", 0),
+                "scans_done": m.stats.get("scans_done", 0),
+                "started_at": m.stats.get("started_at"),
+                "scan_interval_sec": getattr(m, "scan_interval_sec", None),
                 "hot_watchlist_sample": sorted(m._hot_watchlist)[:10],
             }
         data = json.dumps(payload, ensure_ascii=False).encode("utf-8")
-        try:
-            self.send_response(200)
-            self.send_header("Content-Type", "application/json; charset=utf-8")
-            self.send_header("Content-Length", str(len(data)))
-            self.send_header("Access-Control-Allow-Origin", "*")
-            self.end_headers()
-            self.wfile.write(data)
-        except (BrokenPipeError, ConnectionResetError):
-            logger.debug("client disconnected during /api/alerts")
-        except OSError as e:
-            logger.warning("send failed (/api/alerts): %s", e)
+        # 走统一出口（CORS 收敛 + no-store + 断连保护）
+        self._send_json_data(200, data)
+
+
+def _safe_close_tdx() -> None:
+    """关闭 TDX 连接（关停线程调用；自己吞掉所有异常）。
+
+    单独抽出来是为了能在独立线程里跑 —— close() 可能卡在 tdx_client._init_lock 上
+    （后台线程正卡在 TQ 调用里时），而关停流程不能被无限期挂住（巡检 P0-4）。
+    """
+    try:
+        tdx_client.close(timeout=8)
+    except Exception as e:
+        logger.warning("[stop] TDX 关闭异常: %s", e)
 
 
 def _is_port_in_use(port, host="127.0.0.1", timeout=1.5):
@@ -1715,36 +1852,47 @@ def main(port=None, fetch_interval=180):
             print(f"[init] error: {e}", flush=True)
     threading.Thread(target=initial_fetch, daemon=True).start()
 
-    srv = ThreadingHTTPServer((bind_host, port), Handler)
-    print(f"  [OK] HTTP 服务启动: {bind_host}:{port}（线程化）", flush=True)
-
     # 优雅关停：keepalive 重启看板前 POST /api/shutdown（仅本机），
     # 让这里走 finally 分支正常退出 —— 归还通达信的 TQ 槽位，别被强杀烧掉
     global _SHUTDOWN_HOOK
 
-    def _shutdown_hook():
-        try:
-            srv.shutdown()
-        except Exception:
-            pass
-
-    _SHUTDOWN_HOOK = _shutdown_hook
+    srv = None
     try:
+        # 注意：srv 的创建必须在 try 之内（巡检 P0-5）。
+        # 原来它建在 try 外面，bind 失败时异常直接抛出 main()，
+        # 而下面 3 个后台线程是**非守护**线程 —— 解释器会一直等它们，
+        # 进程既不退出也不调 tdx_client.close()，TQ 槽位永久占死。
+        srv = ThreadingHTTPServer((bind_host, port), Handler)
+        print(f"  [OK] HTTP 服务启动: {bind_host}:{port}（线程化）", flush=True)
+
+        def _shutdown_hook():
+            try:
+                srv.shutdown()
+            except Exception:
+                pass
+
+        _SHUTDOWN_HOOK = _shutdown_hook
         srv.serve_forever()
     except KeyboardInterrupt:
         print("\n[stop] Ctrl+C 收到，开始优雅退出", flush=True)
+    except OSError as e:
+        print(f"[FAIL] HTTP 服务启动失败（{bind_host}:{port}）: {e}", flush=True)
+        print("  清理残留进程（PowerShell）:", flush=True)
+        print(f"  Get-NetTCPConnection -LocalPort {port} -State Listen | "
+              "ForEach-Object { Stop-Process -Id $_.OwningProcess -Force }", flush=True)
     finally:
         # 通知后台线程停
         stop_event.set()
         # 关 HTTP（shutdown 停服务循环，server_close 才真正释放端口）
-        try:
-            srv.shutdown()
-        except Exception:
-            pass
-        try:
-            srv.server_close()
-        except Exception:
-            pass
+        if srv is not None:
+            try:
+                srv.shutdown()
+            except Exception:
+                pass
+            try:
+                srv.server_close()
+            except Exception:
+                pass
         # 等后台线程（最多 10s）
         stuck = []
         for name, th in [("background_loop", bg_thread),
@@ -1754,12 +1902,24 @@ def main(port=None, fetch_interval=180):
             if th.is_alive():
                 logger.warning("[stop] %s 未能在 10s 内退出，强制离开", name)
                 stuck.append(name)
-        # 关 TDX 资源（如果有）—— 这一步会归还通达信的 TQ 槽位，必须在强退前做
-        if TDX_OK:
+        # 停告警监控（它的线程还在用 TQ；不停就关连接 = 在活跃调用上 CloseConnect，
+        # 那是通达信客户端崩溃的诱因，巡检 P2-6）
+        if _alert_monitor_inst is not None:
             try:
-                tdx_client.close()
+                _alert_monitor_inst.stop()
             except Exception:
                 pass
+        # 关 TDX 资源（如果有）—— 这一步会归还通达信的 TQ 槽位，必须在强退前做。
+        # close() 可能卡在 _init_lock 上（后台线程正卡在 TQ 调用里），
+        # 所以放独立线程并限时等待：卡住就直接走 os._exit 兜底，
+        # 绝不能让 finally 永远结束不了（巡检 P0-4）。
+        if TDX_OK:
+            closer = threading.Thread(target=_safe_close_tdx, daemon=True)
+            closer.start()
+            closer.join(timeout=10)
+            if closer.is_alive():
+                logger.warning("[stop] TDX 关闭超时（10s），槽位可能泄漏")
+                stuck.append("tdx_client.close")
         print("[stop] 退出完成", flush=True)
         if stuck:
             # 后台线程卡在 TQ 调用里退不出来时，它们是非守护线程 —— 解释器会

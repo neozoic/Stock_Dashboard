@@ -104,6 +104,36 @@ class Alert:
 # ============================================================
 # 交易时段判断
 # ============================================================
+_trade_calendar: Optional[Set[str]] = None
+_trade_calendar_last_try = 0.0
+_trade_calendar_lock = threading.Lock()
+
+
+def _get_trade_calendar():
+    """取 A 股交易日历（含法定节假日），失败返回 None。
+
+    来源：akshare.tool_trade_date_hist_sina（8797 个交易日，覆盖到 2026-12-31）。
+    每天只取一次，失败后 1 小时内不重试（免得每次调用都去打网络）。
+    """
+    global _trade_calendar, _trade_calendar_last_try
+    with _trade_calendar_lock:
+        if _trade_calendar is not None:
+            return _trade_calendar
+        if time.time() - _trade_calendar_last_try < 3600:
+            return None
+        _trade_calendar_last_try = time.time()
+        try:
+            import akshare as ak
+            df = ak.tool_trade_date_hist_sina()
+            cal = {str(d) for d in df["trade_date"].tolist()}
+            _trade_calendar = cal
+            logger.info("已加载 A 股交易日历: %d 个交易日", len(cal))
+            return cal
+        except Exception as e:
+            logger.debug("取 A 股交易日历失败，降级为只判 weekday: %s", e)
+            return None
+
+
 def in_trading_hours(now=None) -> bool:
     """是否 A 股交易时段（北京时间，周一至周五 9:30-11:30 / 13:00-15:00）。
 
@@ -111,9 +141,16 @@ def in_trading_hours(now=None) -> bool:
     alert_monitor 是被 stock_dashboard 导入的，反向 import 会形成循环依赖。
 
     本机时区不是 Asia/Shanghai，必须显式按 UTC+8 换算。
+
+    **法定节假日也要排除**：原来只判 weekday —— 国庆/春节这些"工作日休市日"
+    会被当成交易日，于是反复推送**上一交易日收盘时**的涨停股（巡检 P1-11）。
+    交易日历取不到时降级为只判 weekday（宁可多扫，也不要完全不扫）。
     """
     now = now or datetime.now(timezone(timedelta(hours=8)))
     if now.weekday() > 4:
+        return False
+    cal = _get_trade_calendar()
+    if cal is not None and now.strftime("%Y-%m-%d") not in cal:
         return False
     t = now.time()
     return (dtime(9, 30) <= t <= dtime(11, 30)) or (dtime(13, 0) <= t <= dtime(15, 0))
@@ -124,19 +161,36 @@ def in_trading_hours(now=None) -> bool:
 # ============================================================
 
 class Throttler:
-    """每只股票 + 异动类型 组合，5 分钟最多推 1 次"""
+    """每只股票 + 异动类型 组合，5 分钟最多推 1 次。
+
+    另外加**日级去重**：同一 code + 类型 + 涨幅，只推一次/天。
+    原来只有 5 分钟窗口 —— 一只涨停股从 9:30 到 15:00 能被推 60 多次，
+    全市场扫描一轮能产生几千条推送（巡检 P1-12）。
+    """
+
     def __init__(self, interval_sec: float = 300):
         self.interval = interval_sec
         self._last_sent: Dict[str, float] = {}
+        self._daily_sent: Set[str] = set()
+        self._daily_key = ""
         self._lock = threading.Lock()
 
-    def should_send(self, code: str, alert_type: str) -> bool:
+    def should_send(self, code: str, alert_type: str, price=None) -> bool:
         key = f"{code}:{alert_type}"
         now = time.time()
+        day = datetime.now(timezone(timedelta(hours=8))).strftime("%Y-%m-%d")
         with self._lock:
+            if self._daily_key != day:
+                self._daily_key = day
+                self._daily_sent.clear()
             last = self._last_sent.get(key, 0)
             if now - last < self.interval:
                 return False
+            if price is not None:
+                day_key = f"{day}|{key}|{price}"
+                if day_key in self._daily_sent:
+                    return False
+                self._daily_sent.add(day_key)
             self._last_sent[key] = now
             return True
 
@@ -360,6 +414,10 @@ class RealtimeAlertMonitor:
         # 轮询配置
         self.scan_interval_sec = 60     # 全市场扫描间隔（兜底层）
         self.scan_chunk_size = 500      # 每次批量拉多少只的 fund_flow
+        # 扫描游标：每轮从上次停下的位置继续，保证全集都能轮到
+        # （原来每轮都从 to_scan[0] 开始，而 to_scan 来自 set 迭代顺序，
+        #  排在后面的约一半代码永远扫不到，巡检 P1-10）
+        self._scan_cursor = 0
 
         # 统计（多线程自增，需加锁）
         self.stats = {
@@ -489,7 +547,13 @@ class RealtimeAlertMonitor:
                 pass
 
         try:
-            self._tq.subscribe_hq(stock_list=codes, callback=on_data)
+            res = self._tq.subscribe_hq(stock_list=codes, callback=on_data)
+            # tqcenter 订阅失败时只 print 然后 return None（不抛异常）——
+            # 原来无条件打印"订阅成功"并写入 _subscribed，状态与实际不符，
+            # 排障时极具误导（巡检 P2-13）。
+            if not res:
+                logger.error("订阅失败：tqcenter 返回空结果（%d 只未订阅）", len(codes))
+                return
             with self._lock:
                 self._subscribed.update(codes)
             logger.info("订阅成功: %d 只", len(codes))
@@ -504,6 +568,10 @@ class RealtimeAlertMonitor:
             logger.error("AlertMonitor 启动失败：tq init 失败")
             return
         self._running = True
+        # stop() 置位过 _stop_event 后必须 clear —— 否则 stop→start 之后
+        # _stop_event.wait(...) 立即返回，扫描线程变成无节流死循环
+        # （每秒一轮全市场 5000 次调用，巡检 P2-12）
+        self._stop_event.clear()
         self.stats['started_at'] = time.time()
 
         # 线程 1: 订阅推送处理（秒级）
@@ -536,10 +604,12 @@ class RealtimeAlertMonitor:
 
     def _run(self):
         """订阅推送处理线程"""
+        import tdx_client
         # 初始订阅 hot_watchlist
         with self._lock:
             initial_codes = list(self._hot_watchlist)
         self._subscribe(initial_codes)
+        last_generation = tdx_client.get_connection_generation()
 
         while self._running:
             try:
@@ -552,6 +622,18 @@ class RealtimeAlertMonitor:
                     code = payload
                     self._handle_update(code)
                 elif event_type == 'resubscribe':
+                    with self._lock:
+                        codes = list(self._hot_watchlist)
+                    self._subscribe(codes)
+
+                # TQ 连接被重建后，DLL 侧的实时订阅会随之消失 —— 而 tq.run_id
+                # 重连前后不变（实测都是 1），只能靠 tdx_client 的连接世代号判断。
+                # 不重订阅的后果：/api/alerts 一直显示 subscribed_size=100，
+                # 但 events_received 永远 0，实时异动静默失效（巡检 P0-8）。
+                gen = tdx_client.get_connection_generation()
+                if gen != last_generation:
+                    last_generation = gen
+                    logger.warning("TQ 连接已重建（generation=%s），重新订阅实时行情", gen)
                     with self._lock:
                         codes = list(self._hot_watchlist)
                     self._subscribe(codes)
@@ -579,7 +661,16 @@ class RealtimeAlertMonitor:
             self._stop_event.wait(self.scan_interval_sec)
 
     def _scan_full_market_once(self):
-        """扫一次全集（hot 之外的股票）"""
+        """扫一次全集（hot 之外的股票）
+
+        两个关键修正（2026-11-22 巡检 P1-9 / P1-10）：
+        ① 原来调 `tq.get_more_info_batch(...)` —— tqcenter 里**没有这个方法**，
+           每轮都 AttributeError 再回退成逐只**串行**调用（一批 500 只）。
+           现在走 tdx_client.batch_get_more_info（并发 + 超时封装）。
+        ② 原来每轮都从 to_scan[0] 开始 —— to_scan 来自 set 迭代顺序（进程内固定），
+           排在后面的约一半代码**永远扫不到**。现在维护游标，每轮接着上轮扫。
+        """
+        import tdx_client
         with self._lock:
             full = list(self._full_watchlist)
             hot = set(self._hot_watchlist)
@@ -589,50 +680,50 @@ class RealtimeAlertMonitor:
         if not to_scan:
             return
 
-        # 分批拉 fund_flow（每批 chunk_size 只），每轮设总时限避免失控
+        # 游标轮转：本轮从上次停下的位置继续
+        cursor = int(self._scan_cursor or 0)
+        if cursor >= len(to_scan):
+            cursor = 0
+        ordered = to_scan[cursor:] + to_scan[:cursor]
+
+        # 分批拉（每批 chunk_size 只），每轮设总时限避免失控
         round_deadline = time.time() + max(self.scan_interval_sec, 60)
-        for i in range(0, len(to_scan), self.scan_chunk_size):
+        scanned = 0
+        for i in range(0, len(ordered), self.scan_chunk_size):
             if not self._running or time.time() > round_deadline:
-                logger.info("本轮扫描终止（stop 或超过每轮时限）: %d/%d", i, len(to_scan))
+                logger.info("本轮扫描终止（stop 或超过每轮时限）: %d/%d", i, len(ordered))
                 break
-            chunk = to_scan[i:i + self.scan_chunk_size]
+            chunk = ordered[i:i + self.scan_chunk_size]
             try:
-                flows = self._tq.get_more_info_batch(
-                    stock_list=chunk,
-                    field_list=['Zjl', 'ZAF', 'Now', 'Fzhsl'],
+                flows = tdx_client.batch_get_more_info(
+                    chunk, field_list=['Zjl', 'ZAF', 'Now', 'Fzhsl'],
+                    max_workers=4, timeout=45,
                 )
-            except AttributeError:
-                # tqcenter 没有批量接口，回退到逐个调（走 tdx_client 超时封装，防止断连卡死）
-                import tdx_client
-                flows = [
-                    tdx_client._call_with_timeout(
-                        self._tq.get_more_info, c, default={}, label=f"scan({c})"
-                    ) for c in chunk
-                ]
             except Exception as e:
-                logger.debug("扫描 batch 失败: %s, 回退逐个", e)
-                import tdx_client
-                flows = [
-                    tdx_client._call_with_timeout(
-                        self._tq.get_more_info, c, default={}, label=f"scan({c})"
-                    ) for c in chunk
-                ]
+                logger.warning("扫描 batch 失败: %s", e)
+                flows = []
+            by_code = {f.get("code"): f for f in flows if f and f.get("code")}
+            scanned += len(chunk)
 
             # 检测异动
-            for code, info in zip(chunk, flows):
+            for code in chunk:
+                info = by_code.get(code)
                 if not info:
                     continue
                 name = self._names.get(code, code)
                 alerts = self.detector.detect(code, name, info)
                 for alert in alerts:
-                    if self.throttler.should_send(code, alert.alert_type):
+                    if self.throttler.should_send(code, alert.alert_type,
+                                                  price=alert.current_zaf):
                         msg = alert.to_markdown()
                         logger.info("异动(扫描): %s %s", code, alert.alert_type)
                         send_feishu_text(msg)
                         if send_warn_to_tdx(alert, info):
                             self._bump_stat('warn_sent')
                         self._bump_stat('alerts_sent')
-            logger.debug("扫描进度: %d/%d", min(i + self.scan_chunk_size, len(to_scan)), len(to_scan))
+            logger.debug("扫描进度: %d/%d", min(i + self.scan_chunk_size, len(ordered)), len(ordered))
+        # 记住本轮停在哪，下轮从那儿继续（保证全集轮转覆盖）
+        self._scan_cursor = (cursor + scanned) % max(1, len(ordered))
 
     def _handle_update(self, code: str):
         """处理单只股票的更新通知"""
@@ -652,7 +743,8 @@ class RealtimeAlertMonitor:
             alerts = self.detector.detect(code, name, info)
 
             for alert in alerts:
-                if self.throttler.should_send(code, alert.alert_type):
+                if self.throttler.should_send(code, alert.alert_type,
+                                              price=alert.current_zaf):
                     msg = alert.to_markdown()
                     logger.info("异动: %s %s", code, alert.alert_type)
                     send_feishu_text(msg)

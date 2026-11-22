@@ -109,6 +109,53 @@ _initialized = False
 _last_init_time = 0.0
 _REINIT_INTERVAL = 300  # 5 分钟无活动自动重连一次，避免长期挂载导致句柄僵死
 
+# 在途 TQ 调用计数。
+# 通达信客户端与 Python 侧通过共享内存通信：对**活跃连接**调 CloseConnect 时，
+# 客户端写回缓冲区会命中已失效的句柄 → TdxW.exe 访问冲突崩溃
+# （2026-11-22 实测 Windows 事件 ID 1000，异常码 0xc0000005，10:00:57）。
+# 因此重建连接前必须确认没有在途调用。
+_inflight = 0
+_inflight_lock = threading.Lock()
+
+# 连接世代号：每次成功建立 TQ 连接 +1。
+# 用途：告警模块据此判断"DLL 侧的订阅是不是随连接重建丢了"——
+# 通达信的实时订阅绑在连接上，连接一重建订阅就没了，
+# 而 tq.run_id 在重连前后不变（实测都是 1），没法用它判断（巡检 P0-8）。
+_conn_generation = 0
+
+
+def get_connection_generation() -> int:
+    """当前 TQ 连接世代号（连接重建后 +1）"""
+    return _conn_generation
+
+
+def _inflight_enter() -> None:
+    global _inflight
+    with _inflight_lock:
+        _inflight += 1
+
+
+def _inflight_exit() -> None:
+    global _inflight
+    with _inflight_lock:
+        if _inflight > 0:
+            _inflight -= 1
+
+
+def _inflight_count() -> int:
+    with _inflight_lock:
+        return _inflight
+
+
+def _wait_inflight_drain(timeout: float = 5.0) -> bool:
+    """等在途 TQ 调用归零。返回 True=已归零，可以安全重建连接。"""
+    deadline = time.time() + timeout
+    while time.time() < deadline:
+        if _inflight_count() == 0:
+            return True
+        time.sleep(0.1)
+    return _inflight_count() == 0
+
 
 def _check_tdx_process_alive() -> Optional[bool]:
     """
@@ -204,19 +251,31 @@ def _test_tdx_init() -> bool:
             ok = False
             for try_mode in [1, 2, 3, 0]:
                 _sys.argv = [_sys_argv_orig[0]] + ['--run_tdx', str(try_mode)]
+                # tqcenter.tq.initialize 在已初始化时是 no-op —— 如果看板已经连着，
+                # 这里复用的就是看板那条连接，此时**绝不能** close，
+                # 否则会把看板正在用的连接关掉（之后 5 分钟所有 TQ 调用抛 RuntimeError）。
+                # 只有"自己新建的连接"才允许在探针结束时归还槽位。
+                self_opened = False
                 try:
+                    was_connected = bool(getattr(tqcenter.tq, "_initialized", False))
                     tqcenter.tq.initialize(_TDX_EXE, dll_path=_TDX_DLL)
+                    self_opened = not was_connected
                     snap = tqcenter.tq.get_market_snapshot("600519.SH")
                     ok = bool(snap and "Now" in snap)
-                    try:
-                        _original_close()  # 显式绕过 _safe_close 的吞掉逻辑
-                    except Exception:
-                        pass
                     if ok:
                         break
                 except Exception:
                     time.sleep(0.2)
+                    ok = False
                     continue
+                finally:
+                    # 归还槽位必须放在 finally：异常路径跳过 close 会永久烧掉一个
+                    # mode 槽位（一次探针最多能连烧 4 个，槽位耗尽后 TQ 再也起不来）
+                    if self_opened:
+                        try:
+                            _original_close()  # 显式绕过 _safe_close 的吞掉逻辑
+                        except Exception:
+                            pass
             return ok
         finally:
             _sys.argv = _sys_argv_orig
@@ -303,13 +362,26 @@ def init(force: bool = False, auto_start: bool = True) -> bool:
                 _initialized = False
                 return False
 
-        # 先尝试释放旧连接（显式绕过 _safe_close 的吞掉逻辑）
-        if _initialized:
+        # 先释放旧连接（显式绕过 _safe_close 的吞掉逻辑）。
+        # 判据用 tqcenter 自己的"真实连接"标志，而不是本模块的 _initialized ——
+        # 超时路径会把 _initialized 置 False，但真实连接还活着（这正是槽位泄漏的来源）。
+        # 且只有在没有在途 TQ 调用时才能关：对活跃连接 CloseConnect 会让通达信
+        # 客户端写回共享内存时命中失效句柄 → TdxW.exe 访问冲突崩溃
+        # （2026-11-22 实测 Event ID 1000 / 0xc0000005），也会打断告警订阅。
+        real_open = bool(getattr(tq, "_initialized", False))
+        if real_open or _initialized:
+            if not _wait_inflight_drain(timeout=5.0):
+                logger.warning(
+                    "仍有 %d 个在途 TQ 调用，跳过本次连接重建"
+                    "（对活跃连接 CloseConnect 会让通达信客户端崩溃）",
+                    _inflight_count(),
+                )
+                return True  # 旧连接还活着，继续用
             try:
-                _original_close()
+                _original_close()  # 显式绕过 _safe_close 的吞掉逻辑
             except Exception:
                 pass
-            _initialized = False
+        _initialized = False
 
         # 强制 run_mode=1 或更高（mode=0 在反复初始化后会被通达信拒绝，
         # 通达信对每个 mode 槽位有限制，多次断开后需要切换 mode）
@@ -322,14 +394,15 @@ def init(force: bool = False, auto_start: bool = True) -> bool:
             for try_mode in [1, 2, 3, 0]:  # 优先非 0（0 是用户手动策略的槽位）
                 try:
                     _sys.argv = [_sys_argv_orig[0]] + ['--run_tdx', str(try_mode)]
-                    # 释放旧连接（显式绕过 _safe_close）
-                    try:
-                        _original_close()
-                    except Exception:
-                        pass
+                    # 这里不再 CloseConnect：旧连接已在循环前统一释放过一次。
+                    # 重复关闭同一个句柄正是客户端崩溃的直接原因；
+                    # 而 initialize 失败的 mode 也不能关 —— 那种失败是"槽位被别人占着"
+                    # （返回ID小于0），关它等于关掉别人的连接。
                     time.sleep(0.3)
                     tq.initialize(_TDX_EXE, dll_path=_TDX_DLL)
                     _initialized = True
+                    global _conn_generation
+                    _conn_generation += 1
                     _last_init_time = now
                     logger.info("TdxQuant 初始化成功 (mode=%s, run_id=%s)", tq.run_mode, tq.run_id)
                     return True
@@ -346,21 +419,43 @@ def init(force: bool = False, auto_start: bool = True) -> bool:
             _sys.argv = _sys_argv_orig
 
 
-def health_check() -> bool:
+def health_check(timeout: float = 6.0) -> bool:
     """
     健康检查：拿一只股票快照，能成功返回 Now 字段说明连接可用。
+
+    必须是**有超时**的：TQ 半死时裸调用会永久卡住调用线程，
+    而后台拉数线程正持有 FETCH_LOCK —— 看板数据会永久停更
+    （2026-11-22 巡检 P1-5）。
+
+    超时**不**把连接标记为失效：全市场扫描期间 TQ 只是忙，不是坏了。
+    只有真正抛异常才标记失效（连接确实坏了，需要重建）。
     """
     global _initialized
     if not _initialized and not init():
         return False
-    try:
-        snap = tq.get_market_snapshot("600519.SH")
-        return bool(snap and "Now" in snap)
-    except Exception as e:
-        logger.warning("健康检查失败: %s", e)
-        # 尝试重连
+    box = {}
+
+    def runner():
+        _inflight_enter()
+        try:
+            box["v"] = tq.get_market_snapshot("600519.SH")
+        except Exception as e:
+            box["e"] = e
+        finally:
+            _inflight_exit()
+
+    th = threading.Thread(target=runner, daemon=True)
+    th.start()
+    th.join(timeout)
+    if th.is_alive():
+        # 超时线程还在 DLL 里跑，连接处于"忙"而非"坏"状态 —— 不污染连接标志
+        logger.warning("健康检查超时（%.1fs），连接可能正忙（不改变连接状态）", timeout)
+        return False
+    if "e" in box:
+        logger.warning("健康检查失败: %s", box["e"])
         _initialized = False
         return False
+    return bool(box.get("v") and "Now" in box["v"])
 
 
 def _ensure_ready() -> None:
@@ -368,9 +463,13 @@ def _ensure_ready() -> None:
     if not _initialized:
         init()
         return
-    # 每隔窗口期刷一次（防止句柄僵死）
-    if (time.time() - _last_init_time) > _REINIT_INTERVAL:
-        init(force=True)
+    # 这里**不再**做周期性强制重连。
+    # 原来的 "每 300s init(force=True)" 会：
+    #   ① 对活跃连接 CloseConnect → 通达信客户端崩溃（实测 0xc0000005）；
+    #   ② 重建连接 → DLL 侧订阅随之消失 → 实时异动静默失效。
+    # 现在改成"按需重建"：连接真出问题时由 health_check 捕获异常把
+    # _initialized 置 False，下一次调用走 init() 重建（init 内部会先等在途调用归零）。
+    return
 
 
 # ============================================================
@@ -390,23 +489,27 @@ def _call_with_timeout(func, *args, timeout=None, default=None, label="", **kwar
     box = {}
 
     def runner():
+        # 计入"在途调用"：超时后线程仍在 DLL 里跑，重建连接时必须避开它
+        _inflight_enter()
         try:
             box["value"] = func(*args, **kwargs)
         except Exception as e:
             box["error"] = e
         finally:
             box["done"] = True
+            _inflight_exit()
 
     th = threading.Thread(target=runner, daemon=True)
     th.start()
     th.join(timeout)
     if not box.get("done"):
         logger.warning("%s 超时（%.1fs），返回默认 %s", label or func.__name__, timeout, default)
-        # 超时意味着连接可能已僵死：标记断连，让下次调用触发 init(force) 强重连，
-        # 否则泄漏线程持有的旧连接会一直被复用。
+        # 注意：这里**不**把 _initialized 置 False。
+        #   ① 超时通常意味着"TQ 忙"（全市场扫描期间），不是连接坏了；
+        #   ② 置 False 会触发 init(force=True) 重建连接 —— 而超时线程还没退，
+        #      重建正是让通达信客户端崩溃的动作。
+        # 真正坏掉的连接由 health_check() 捕获异常后标记失效。
         # 已知限制：超时的 daemon 线程无法强杀，会泄漏到进程结束。
-        global _initialized
-        _initialized = False
         return default
     if "error" in box:
         logger.debug("%s 异常: %s", label or func.__name__, box["error"])
@@ -737,13 +840,14 @@ _SEND_FAIL = object()  # 哨兵：区分"调用成功但返回 None"与"超时/�
 
 
 def send_warn_signals(stock_list, time_list, price_list, bs_flag_list,
-                      close_list, reason_list) -> bool:
+                      close_list, reason_list, volum_list=None) -> bool:
     """
     推送预警信号到通达信 TQ 策略信号窗口（tq.send_warn 封装）。
 
     Args:
         bs_flag_list: 0=买(红B), 1=卖(绿S), 2=未知(黄双叠三角)
         time_list: 'YYYYMMDDHHMMSS' 格式
+        volum_list:  成交量列表；不传则补 0。
 
     Returns:
         True=调用成功（send_warn 成功时返回 None，用哨兵区分）；False=未就绪/超时/异常。
@@ -754,6 +858,16 @@ def send_warn_signals(stock_list, time_list, price_list, bs_flag_list,
         return False
     if not _ensure_ready_silent():
         return False
+    # volum_list 是 tqcenter 的**必填**列表（get_warn_struct_str 里
+    # required_lists 含 volum_list，len < count 直接 raise ValueError
+    # "volum_list元素数量不足"）—— 原来没传，导致**每次推送必然失败**，
+    # TQ 信号窗口永远收不到异动（2026-11-22 巡检 P1-8）。
+    if volum_list is None:
+        volum_list = ["0"] * n
+    else:
+        volum_list = [str(v if v is not None else 0) for v in volum_list]
+        if len(volum_list) < n:
+            volum_list = volum_list + ["0"] * (n - len(volum_list))
     res = _call_with_timeout(
         tq.send_warn,
         stock_list=list(stock_list),
@@ -761,12 +875,17 @@ def send_warn_signals(stock_list, time_list, price_list, bs_flag_list,
         price_list=[float(p or 0) for p in price_list],
         bs_flag_list=[int(b) for b in bs_flag_list],
         close_list=[float(c or 0) for c in close_list],
+        volum_list=volum_list[:n],
         reason_list=[str(r) for r in reason_list],
         count=n,
         default=_SEND_FAIL,
         label=f"send_warn({n} signals)",
     )
-    return res is not _SEND_FAIL
+    if res is _SEND_FAIL:
+        # 失败要记 warning 而不是 debug —— 原来用 debug，故障完全不可见
+        logger.warning("send_warn 失败（%d 条信号未送达 TQ 信号窗口）", n)
+        return False
+    return True
 
 
 # ============================================================
@@ -869,6 +988,46 @@ def _batch_run(func, codes, max_workers, timeout, result_timeout, label, require
     return results
 
 
+def get_more_info(stock_code: str, field_list=None) -> Dict:
+    """单只股票的更多信息（涨幅/换手等）。
+
+    TQ 不下发资金流分类数据（level-1 客户端限制）时，告警扫描靠这个接口
+    拿 Zjl/ZAF/Now 等字段。
+    """
+    if not _ensure_ready_silent():
+        return {}
+    kwargs = {}
+    if field_list:
+        kwargs["field_list"] = list(field_list)
+    raw = _call_with_timeout(
+        tq.get_more_info, stock_code, default=None,
+        label=f"get_more_info({stock_code})", **kwargs
+    )
+    if not isinstance(raw, dict):
+        return {}
+    return raw
+
+
+def batch_get_more_info(codes: List[str], field_list=None,
+                        max_workers: int = 6, timeout: float = 60.0) -> List[Dict]:
+    """批量取"更多信息"。
+
+    alert_monitor 原来调的是 `tq.get_more_info_batch(...)` —— tqcenter 里
+    **没有这个方法**，每轮都 AttributeError 然后回退成逐只**串行**调用
+    （巡检 P1-9）。这里走既有的并发骨架。
+    """
+    def _one(code: str) -> Dict:
+        info = get_more_info(code, field_list)
+        if not info:
+            return {}
+        out = dict(info)
+        out.setdefault("code", code)
+        return out
+
+    return _batch_run(_one, list(codes), max_workers, timeout,
+                      result_timeout=10, label="batch_get_more_info")
+
+
 def batch_snapshot(
     codes: List[str],
     max_workers: int = 8,
@@ -934,16 +1093,30 @@ def rank_by_fund_flow(
     return flows[:top_n]
 
 
-def close() -> None:
-    """关闭连接（一般不需要手动调，模块退出时会自动 close）。"""
+def close(timeout: float = 5.0) -> None:
+    """关闭连接，归还通达信 TQ 槽位。
+
+    **不能用 self._initialized 门控**：超时路径会把 _initialized 置 False，
+    而此时真实连接还活着 —— 门控会让槽位永远不归还
+    （2026-11-22 巡检 P0-1：mode 槽位只有 4 个，烧光后 TQ 再也起不来）。
+
+    拿锁带超时：初始化线程持锁时（例如卡在 PowerShell 探测里），
+    关停流程不能被无限期挂住（巡检 P0-4）。
+    """
     global _initialized
-    with _init_lock:
-        if _initialized:
-            try:
-                _original_close()  # 显式绕过 _safe_close 的吞掉逻辑
-            except Exception:
-                pass
+    if not _init_lock.acquire(timeout=timeout):
+        logger.warning("close() 拿不到 _init_lock（超时 %.1fs），跳过连接关闭", timeout)
+        return
+    try:
+        # 无条件调用：真实连接状态可能与 _initialized 标志不一致
+        try:
+            _original_close()  # 显式绕过 _safe_close 的吞掉逻辑
+        except Exception as e:
+            logger.debug("close 失败: %s", e)
+        finally:
             _initialized = False
+    finally:
+        _init_lock.release()
 
 
 # 注册 atexit 自动关闭
