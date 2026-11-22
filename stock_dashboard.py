@@ -40,16 +40,55 @@ import time
 import socket
 import threading
 import logging
+import logging.handlers
 import warnings
 from http.server import BaseHTTPRequestHandler, HTTPServer
 from socketserver import ThreadingMixIn
 from datetime import datetime, timezone, timedelta, time as dtime
 
 warnings.filterwarnings("ignore")
-logging.basicConfig(
-    level=logging.INFO,
-    format="%(asctime)s [%(levelname)s] %(message)s",
-)
+
+# === 日志 ===
+# 业务日志写 logs/dashboard.log，由 Python 的 RotatingFileHandler 自行轮转。
+# 为什么不用 stderr：看板进程的 stdout/stderr 被外层(start_dashboard.bat /
+# keepalive)以文件句柄方式重定向，Windows 下文件被占用时无法改名
+# ("Device or resource busy")；退化成截断又会因写入方偏移量不回退，
+# 在文件头留下一整段 NUL 空洞(实测 2.9MB 里 2.86MB 是空洞)。
+# 交给 Python 自己管：轮转时先 close 再 rename，Windows 上可行且无空洞。
+LOG_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "logs")
+LOG_MAX_BYTES = int(os.environ.get("DASHBOARD_LOG_MAX_BYTES", 8 * 1024 * 1024))
+LOG_BACKUP_COUNT = int(os.environ.get("DASHBOARD_LOG_KEEP", 3))
+
+
+def _setup_logging():
+    """配置 root logger：只写 logs/dashboard.log，不再往 stderr 灌日志。
+
+    stderr 只留给 print / 未捕获异常（看板外层重定向到 dashboard.stderr.log，
+    体积很小，不需要轮转）。
+    """
+    fmt = "%(asctime)s [%(levelname)s] %(message)s"
+    try:
+        os.makedirs(LOG_DIR, exist_ok=True)
+        root = logging.getLogger()
+        for h in list(root.handlers):
+            root.removeHandler(h)
+        handler = logging.handlers.RotatingFileHandler(
+            os.path.join(LOG_DIR, "dashboard.log"),
+            maxBytes=LOG_MAX_BYTES,
+            backupCount=LOG_BACKUP_COUNT,
+            encoding="utf-8",
+        )
+        handler.setFormatter(logging.Formatter(fmt))
+        root.addHandler(handler)
+        root.setLevel(logging.INFO)
+        return True
+    except Exception:
+        # 落盘失败就退回 stderr，至少别把日志丢了
+        logging.basicConfig(level=logging.INFO, format=fmt)
+        return False
+
+
+_setup_logging()
 logger = logging.getLogger("dashboard")
 
 # === 北京时间工具 ===

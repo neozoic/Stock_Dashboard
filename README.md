@@ -64,7 +64,8 @@ start_oneclick.bat
 
 启动成功后：
 
-- 后端日志写入 `logs\dashboard.stdout.log` / `logs\dashboard.stderr.log`
+- 业务日志写入 `logs\dashboard.log`(由 Python 自己轮转,保留 3 代);
+  `logs\dashboard.stdout.log` / `logs\dashboard.stderr.log` 只收启动横幅与未捕获异常
 - 浏览器打开 `http://localhost:8765/`
 
 > 手动启动只保证"这一次在跑"。想让看板在崩溃/重启后自动回来,见下面的
@@ -119,7 +120,7 @@ python stock_dashboard.py
 - **红点 + "非交易时段"**：当前北京时间不在交易时段（盘前/午休/收盘后），
   看板表格仍会显示最近一次快照，但趋势图只有历史点。
 - **"❌ 数据获取失败"**：`fetch('/api/data')` 失败，通常是后端未启动或端口冲突；
-  先看 `logs\dashboard.stderr.log`。
+  先看 `logs\dashboard.log`(业务日志)与 `logs\dashboard.stderr.log`(未捕获异常)。
 
 ## 详细变更与维护日志
 
@@ -194,18 +195,24 @@ keepalive 的行为矩阵:
 - **看板进程在 TQ 未就绪时启动会被"毒化"** —— 进程内 `tq.initialize` 一旦失败就
   再也连不上,只能重启进程。所以 keepalive 会先用独立子进程探测 TQ 就绪,
   再拉看板。
-- **限流**:1 小时内最多重启 3 次,防止异常时反复重启打爆 CPU。
-- **日志滚动**:拉看板前若 `dashboard.stdout.log` / `dashboard.stderr.log`
-  超过 8MB 就滚动一代(`.1`/`.2`/`.3`)。
+- **限流**:15 分钟内最多重启 3 次(挡住崩溃循环的秒级重启)+ 1 小时内最多 10 次(防缓慢抖动)。
+  旧版只看"1 小时内绝对次数",早上的重启记录会一直占着预算,导致看板稳定运行后
+  一次正常杀进程也拉不起来。
+- **日志滚动**:业务日志 `logs\dashboard.log` 由看板自己的 RotatingFileHandler 轮转
+  (8MB 一代,保留 3 代)。`dashboard.stdout.log` / `dashboard.stderr.log` 是外层重定向的
+  应急输出,被看板占用时 Windows 改不了名 —— 此时只告警、**不截断**:截断会让写入方
+  偏移量不回退,在文件头留下一整段 NUL 空洞。
 
 常用环境变量(改 `tools\install_keepalive.bat` 或系统环境变量):
 
 | 变量 | 默认 | 说明 |
 |---|---|---|
-| `DASHBOARD_LOG_MAX_BYTES` | `8388608` | 日志滚动阈值 |
+| `DASHBOARD_LOG_MAX_BYTES` | `8388608` | 日志滚动阈值(看板 `dashboard.log` 与 keepalive 共用) |
 | `DASHBOARD_LOG_KEEP` | `3` | 保留几代日志 |
 | `DASHBOARD_TDX_FAIL_THRESHOLD` | `3` | TQ 连续异常几次才重启看板 |
-| `DASHBOARD_MAX_RESTARTS_PER_HOUR` | `3` | 每小时最多重启次数 |
+| `DASHBOARD_MAX_RESTARTS_BURST` | `3` | 突发窗口内最多重启次数(崩溃循环保护) |
+| `DASHBOARD_RESTART_BURST_WINDOW` | `900` | 突发窗口秒数(默认 15 分钟) |
+| `DASHBOARD_MAX_RESTARTS_PER_HOUR` | `10` | 每小时最多重启次数(防缓慢抖动) |
 
 ### 手动控制已注册任务
 ```cmd

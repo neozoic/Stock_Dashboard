@@ -7,7 +7,8 @@
   1. 看板进程死了 -> 拉起（通达信不在则先拉通达信，通达信停在登录框则自动点登录）
   2. 看板活着但 TQ 断了 (tdx_health != ok) 连续 N 次 -> 重启看板进程
      （进程内 TQ 状态中毒后无法自愈，重启是唯一解）
-  3. 拉起前滚动日志，避免 dashboard.stdout.log / dashboard.stderr.log 无上限膨胀
+  3. 拉起前滚动应急日志（dashboard.stdout.log / dashboard.stderr.log）；
+     业务日志由看板自己的 RotatingFileHandler 写 logs/dashboard.log，这里不管
 
 行为矩阵:
   +------------------+-----------------+------------------------------------------+
@@ -58,8 +59,11 @@ LOG_KEEP = int(os.environ.get("DASHBOARD_LOG_KEEP", 3))
 
 # TQ 假死连续几次才重启看板（每 5 分钟一次 -> 15 分钟容忍窗）
 TDX_FAIL_THRESHOLD = int(os.environ.get("DASHBOARD_TDX_FAIL_THRESHOLD", 3))
-# 1 小时内最多重启几次
-MAX_RESTARTS_PER_HOUR = int(os.environ.get("DASHBOARD_MAX_RESTARTS_PER_HOUR", 3))
+# 1 小时内最多重启几次（总量上限，防缓慢抖动）
+MAX_RESTARTS_PER_HOUR = int(os.environ.get("DASHBOARD_MAX_RESTARTS_PER_HOUR", 10))
+# 崩溃自愈的突发限制：真崩溃循环会在秒级~分钟级反复重启
+MAX_RESTARTS_BURST = int(os.environ.get("DASHBOARD_MAX_RESTARTS_BURST", 3))
+RESTART_BURST_WINDOW = int(os.environ.get("DASHBOARD_RESTART_BURST_WINDOW", 900))
 # 拉起通达信后等 TQ 接口就绪的最长时间（秒）
 TDX_READY_TIMEOUT = int(os.environ.get("DASHBOARD_TDX_READY_TIMEOUT", 120))
 
@@ -155,11 +159,24 @@ def save_state(st: dict) -> None:
 
 
 def restart_budget_ok(st: dict) -> bool:
-    """1 小时内重启次数未超限"""
+    """重启限流：挡住崩溃循环，但别让"早已恢复"的旧重启一直占着预算。
+
+    只看 1 小时内的绝对次数会踩坑：早上恢复过 3 次后，即使看板随后稳定
+    运行了半小时，一次正常杀进程（人工/系统更新/内存回收）也会被预算挡住，
+    看板就这么一直停着（实测踩到）。改成两级：
+
+      - 突发限制：RESTART_BURST_WINDOW(默认 15 分钟) 内最多 MAX_RESTARTS_BURST 次
+        —— 真崩溃循环的形态就是短时间内反复重启
+      - 总量限制：1 小时内最多 MAX_RESTARTS_PER_HOUR 次 —— 防缓慢抖动
+    """
     now = time.time()
-    recent = [t for t in st.get("restarts", []) if now - float(t) < 3600]
-    st["restarts"] = recent
-    return len(recent) < MAX_RESTARTS_PER_HOUR
+    restarts = [float(t) for t in st.get("restarts", [])]
+    burst = [t for t in restarts if now - t < RESTART_BURST_WINDOW]
+    hourly = [t for t in restarts if now - t < 3600]
+    st["restarts"] = hourly
+    if len(burst) >= MAX_RESTARTS_BURST:
+        return False
+    return len(hourly) < MAX_RESTARTS_PER_HOUR
 
 
 def record_restart(st: dict) -> None:
@@ -269,11 +286,18 @@ def kill_port_listeners(port: int) -> int:
 def rotate_logs(max_bytes: int = LOG_MAX_BYTES, keep: int = LOG_KEEP) -> list:
     """日志超过阈值就滚动一代：.1 <- .2 <- ...，保留 keep 代
 
-    Windows 上文件正被写时不能改名（"Device or resource busy"），
-    所以先重试几次，还不行就退化成截断（打开时允许共享写，截断可行）。
+    只处理 stdout/stderr 两个"应急输出"文件；业务日志由看板自己写
+    logs/dashboard.log（Python 的 RotatingFileHandler 轮转，close 后再改名，
+    Windows 上可行且无空洞）。
+
+    Windows 上被写着的文件不能改名（"Device or resource busy"）。这里
+    **不再退化成截断**：看板进程持有的文件句柄偏移量不会因截断回退，
+    下一次写入会在文件头补出一整段 NUL 空洞（实测 2.9MB 的 stderr 里
+    2.86MB 是空洞），既撑大文件又让 grep 认成二进制。改名失败就只告警，
+    交给人工处理。
     """
     rotated = []
-    truncated = []
+    blocked = []
     LOG_DIR.mkdir(parents=True, exist_ok=True)
     for name in ("dashboard.stdout.log", "dashboard.stderr.log"):
         p = LOG_DIR / name
@@ -282,7 +306,6 @@ def rotate_logs(max_bytes: int = LOG_MAX_BYTES, keep: int = LOG_KEEP) -> list:
                 continue
         except Exception:
             continue
-        done = False
         for attempt in range(3):
             try:
                 stale = LOG_DIR / f"{name}.{keep}"
@@ -294,26 +317,33 @@ def rotate_logs(max_bytes: int = LOG_MAX_BYTES, keep: int = LOG_KEEP) -> list:
                         src.replace(LOG_DIR / f"{name}.{i + 1}")
                 p.replace(LOG_DIR / f"{name}.1")
                 rotated.append(name)
-                done = True
                 break
             except Exception as e:
                 if attempt == 2:
-                    # 文件还被占着 -> 退化成截断
-                    try:
-                        with open(p, "r+b"):
-                            pass
-                        os.truncate(str(p), 0)
-                        truncated.append(name)
-                        done = True
-                    except Exception as e2:
-                        log(f"滚动 {name} 失败: {e} / 截断也失败: {e2}")
+                    blocked.append(f"{name}({e})")
                 else:
                     time.sleep(0.5)
     if rotated:
         log(f"日志已滚动: {', '.join(rotated)} (阈值 {max_bytes // 1024 // 1024}MB)")
-    if truncated:
-        log(f"日志被占用无法改名, 已截断: {', '.join(truncated)}")
-    return rotated + truncated
+    if blocked:
+        log(f"[WARN] 日志被占用无法改名(不截断, 避免产生空洞): {', '.join(blocked)}")
+    return rotated
+
+
+def check_log_sizes(max_bytes: int = LOG_MAX_BYTES) -> None:
+    """看板存活期间也看一眼应急日志大小。
+
+    业务日志由看板自己轮转（logs/dashboard.log），这里只管 stdout/stderr。
+    被看板占用时无法改名，也不截断（截断会在文件头留 NUL 空洞），只告警。
+    """
+    for name in ("dashboard.stdout.log", "dashboard.stderr.log"):
+        p = LOG_DIR / name
+        try:
+            if p.exists() and p.stat().st_size > max_bytes:
+                log(f"[WARN] {name} 已达 {p.stat().st_size // 1024 // 1024}MB，"
+                    f"被看板占用无法改名（不截断以免产生空洞）")
+        except Exception:
+            pass
 
 
 # ============================================================
@@ -478,6 +508,7 @@ def main() -> int:
                 st["tdx_fail_count"] = 0
                 st.pop("needs_tdx_restart", None)
                 save_state(st)
+            check_log_sizes()
             log(f"看板正常 (port {DASHBOARD_PORT}, tdx_health=ok)", quiet=True)
             return 0  # 一切正常, 静默
 
@@ -502,7 +533,7 @@ def main() -> int:
             save_state(st)
         if pending or st["tdx_fail_count"] >= TDX_FAIL_THRESHOLD:
             if not restart_budget_ok(st):
-                log("[WARN] 1 小时内重启次数已超限，放弃自愈，等人工介入")
+                log(f"[WARN] 重启次数超限({RESTART_BURST_WINDOW}s 内 {MAX_RESTARTS_BURST} 次 / 1h 内 {MAX_RESTARTS_PER_HOUR} 次)，放弃自愈，等人工介入")
                 return 0
             log("[ACTION] TQ 连续异常，重启看板进程")
             kill_port_listeners(DASHBOARD_PORT)
@@ -539,7 +570,7 @@ def main() -> int:
         st["needs_tdx_restart"] = True
 
     if not restart_budget_ok(st):
-        log("[WARN] 1 小时内重启次数已超限，放弃拉起，等人工介入")
+        log(f"[WARN] 重启次数超限({RESTART_BURST_WINDOW}s 内 {MAX_RESTARTS_BURST} 次 / 1h 内 {MAX_RESTARTS_PER_HOUR} 次)，放弃拉起，等人工介入")
         return 0
 
     record_restart(st)

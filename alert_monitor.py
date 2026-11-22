@@ -24,7 +24,7 @@ import json
 import logging
 import threading
 from typing import Dict, List, Set, Optional
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone, time as dtime
 from queue import Queue
 
 logger = logging.getLogger("alert_monitor")
@@ -99,6 +99,24 @@ class Alert:
             f"  涨幅: {self.current_zaf:+.2f}%\n"
             f"  阈值: {self.threshold:.2f}\n"
         )
+
+
+# ============================================================
+# 交易时段判断
+# ============================================================
+def in_trading_hours(now=None) -> bool:
+    """是否 A 股交易时段（北京时间，周一至周五 9:30-11:30 / 13:00-15:00）。
+
+    与 stock_dashboard.in_trading_hours 保持一致，这里单独实现一份：
+    alert_monitor 是被 stock_dashboard 导入的，反向 import 会形成循环依赖。
+
+    本机时区不是 Asia/Shanghai，必须显式按 UTC+8 换算。
+    """
+    now = now or datetime.now(timezone(timedelta(hours=8)))
+    if now.weekday() > 4:
+        return False
+    t = now.time()
+    return (dtime(9, 30) <= t <= dtime(11, 30)) or (dtime(13, 0) <= t <= dtime(15, 0))
 
 
 # ============================================================
@@ -547,6 +565,12 @@ class RealtimeAlertMonitor:
         logger.info("兜底扫描线程启动 (间隔 %ds)", self.scan_interval_sec)
         while self._running:
             try:
+                if not in_trading_hours():
+                    # 非交易时段 TQ 数据不再变化，扫了也只会把收盘时的同一批
+                    # 涨跌停反复推一遍（实测周末刷出近 900 条重复异动），
+                    # 还会白耗每轮约 5000 次 TQ 调用。开盘后自动恢复。
+                    self._stop_event.wait(self.scan_interval_sec)
+                    continue
                 self._scan_full_market_once()
                 self._bump_stat('scans_done')
             except Exception as e:
@@ -612,6 +636,9 @@ class RealtimeAlertMonitor:
 
     def _handle_update(self, code: str):
         """处理单只股票的更新通知"""
+        if not in_trading_hours():
+            # 非交易时段 TQ 可能还在推收盘前的快照，推出去就是重复的假异动
+            return
         try:
             # 走 tdx_client 超时封装：直调 self._tq 在断连时会永久卡死本线程
             import tdx_client
