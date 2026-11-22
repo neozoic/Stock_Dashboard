@@ -67,6 +67,10 @@ start_oneclick.bat
 - 后端日志写入 `logs\dashboard.stdout.log` / `logs\dashboard.stderr.log`
 - 浏览器打开 `http://localhost:8765/`
 
+> 手动启动只保证"这一次在跑"。想让看板在崩溃/重启后自动回来,见下面的
+> [自动守护(keepalive)](#自动守护keepalive)—— 装好后登录即自启,
+> 之后每 5 分钟体检一次。
+
 ### 直接命令行
 
 ```bat
@@ -152,17 +156,63 @@ tools\start_sync.bat
 日志:`logs\auto_sync.log`
 
 **3. Task Scheduler 开机自启(推荐)**
-用管理员权限运行 cmd:
+普通用户直接跑(不需要管理员权限):
 ```bash
 tools\install_task.bat
 ```
-任务名:`Stock_Dashboard_AutoSync`,触发器:`onlogon`(用户登录时启动)
+等价于 `tools\install_keepalive.bat`,会注册下面两张表里的全部任务。
+载:`python tools\install_keepalive.py --uninstall`
+
+---
+
+## 自动守护(keepalive)
+
+看板是长驻服务,进程会被重启/崩溃/断网带走。`tools/dashboard_watchdog.py`
+是一个幂等的"体检 + 修复"脚本,由计划任务定时调用。
+
+| 任务/自启项 | 触发 | 作用 |
+|---|---|---|
+| `Stock_Dashboard_KeepAlive` | 每 5 分钟 | 体检 + 修复(见下) |
+| `Stock_Dashboard_Startup` (HKCU Run) | 用户登录时 | 拉起通达信 + 看板 |
+| `Stock_Dashboard_AutoSync` | 每 5 分钟 | 自动 commit/push(自带单实例锁) |
+| `Stock_Dashboard_AutoSync` (HKCU Run) | 用户登录时 | 同上 |
+
+keepalive 的行为矩阵:
+
+| 看板(8765) | 通达信 | 动作 |
+|---|---|---|
+| 活 + `tdx_health=ok` | — | 静默,只在 `logs\keepalive.log` 写心跳 |
+| 活 + `tdx_health=fail` | 未登录 | 不重启(重启无用),日志提示手动点登录 |
+| 活 + `tdx_health=fail` | 已登录 | 连续 3 次(15 分钟)→ 重启看板进程 |
+| 死 | 死 | 拉起通达信 → 自动点登录 → 等 TQ 就绪 → 拉起看板 |
+| 死 | 活 | 自动点登录(若需要) → 等 TQ 就绪 → 拉起看板 |
+
+几个关键点:
+
+- **通达信每次启动都停在登录框**,keepalive 会用 `WM_COMMAND` 触发登录对话框的
+  默认按钮(`tools/tdx_login.py`),无需人工点击。
+- **看板进程在 TQ 未就绪时启动会被"毒化"** —— 进程内 `tq.initialize` 一旦失败就
+  再也连不上,只能重启进程。所以 keepalive 会先用独立子进程探测 TQ 就绪,
+  再拉看板。
+- **限流**:1 小时内最多重启 3 次,防止异常时反复重启打爆 CPU。
+- **日志滚动**:拉看板前若 `dashboard.stdout.log` / `dashboard.stderr.log`
+  超过 8MB 就滚动一代(`.1`/`.2`/`.3`)。
+
+常用环境变量(改 `tools\install_keepalive.bat` 或系统环境变量):
+
+| 变量 | 默认 | 说明 |
+|---|---|---|
+| `DASHBOARD_LOG_MAX_BYTES` | `8388608` | 日志滚动阈值 |
+| `DASHBOARD_LOG_KEEP` | `3` | 保留几代日志 |
+| `DASHBOARD_TDX_FAIL_THRESHOLD` | `3` | TQ 连续异常几次才重启看板 |
+| `DASHBOARD_MAX_RESTARTS_PER_HOUR` | `3` | 每小时最多重启次数 |
 
 ### 手动控制已注册任务
 ```cmd
-schtasks /run  /tn "Stock_Dashboard_AutoSync"   :: 立即启动
-schtasks /end  /tn "Stock_Dashboard_AutoSync"   :: 停止当前实例
-schtasks /delete /tn "Stock_Dashboard_AutoSync"  :: 取消注册
+schtasks /run  /tn "Stock_Dashboard_KeepAlive"   :: 立即体检一次
+schtasks /end  /tn "Stock_Dashboard_KeepAlive"   :: 停止当前实例
+schtasks /delete /tn "Stock_Dashboard_KeepAlive"  :: 取消注册
+python tools\install_keepalive.py --uninstall      :: 卸载全部任务与自启项
 ```
 
 ## 已知风险
@@ -170,6 +220,8 @@ schtasks /delete /tn "Stock_Dashboard_AutoSync"  :: 取消注册
 | 风险 | 触发 | 缓解 |
 |---|---|---|
 | 通达信客户端不可用 | 没装 TdxW.exe | 设置 `TDX_HOME` 指向现有安装；否则看板走 akshare 兜底 |
+| 通达信停在登录框 | 客户端每次启动都要点一次登录 | keepalive 会自动点(`tools/tdx_login.py`)；没装 keepalive 就手动点一下 |
+| 看板进程活着但 TQ 连不上 | 进程在 TQ 未就绪时启动，状态被"毒化" | keepalive 检测到连续 3 次异常会重启看板；手动可 `stop_dashboard.bat` 后重启 |
 | 8765 端口冲突 | 旧实例未清 | `Get-NetTCPConnection -LocalPort 8765 -State Listen` 查 PID 后 `Stop-Process` |
 | ECharts 渲染失败 | `echarts.min.js` 缺失 | 已预下载到同目录；如需恢复 CDN 引用，编辑 `dashboard.html` 头部 `<script>` |
 | 0.0.0.0 暴露公网 | 共享/容器网络 | `DASHBOARD_BIND=127.0.0.1` 或经反向代理 |
