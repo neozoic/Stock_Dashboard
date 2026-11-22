@@ -267,8 +267,13 @@ def kill_port_listeners(port: int) -> int:
 # 日志滚动
 # ============================================================
 def rotate_logs(max_bytes: int = LOG_MAX_BYTES, keep: int = LOG_KEEP) -> list:
-    """日志超过阈值就滚动一代：.1 <- .2 <- ...，保留 keep 代"""
+    """日志超过阈值就滚动一代：.1 <- .2 <- ...，保留 keep 代
+
+    Windows 上文件正被写时不能改名（"Device or resource busy"），
+    所以先重试几次，还不行就退化成截断（打开时允许共享写，截断可行）。
+    """
     rotated = []
+    truncated = []
     LOG_DIR.mkdir(parents=True, exist_ok=True)
     for name in ("dashboard.stdout.log", "dashboard.stderr.log"):
         p = LOG_DIR / name
@@ -277,21 +282,38 @@ def rotate_logs(max_bytes: int = LOG_MAX_BYTES, keep: int = LOG_KEEP) -> list:
                 continue
         except Exception:
             continue
-        try:
-            stale = LOG_DIR / f"{name}.{keep}"
-            if stale.exists():
-                stale.unlink()
-            for i in range(keep - 1, 0, -1):
-                src = LOG_DIR / f"{name}.{i}"
-                if src.exists():
-                    src.replace(LOG_DIR / f"{name}.{i + 1}")
-            p.replace(LOG_DIR / f"{name}.1")
-            rotated.append(name)
-        except Exception as e:
-            log(f"滚动 {name} 失败: {e}")
+        done = False
+        for attempt in range(3):
+            try:
+                stale = LOG_DIR / f"{name}.{keep}"
+                if stale.exists():
+                    stale.unlink()
+                for i in range(keep - 1, 0, -1):
+                    src = LOG_DIR / f"{name}.{i}"
+                    if src.exists():
+                        src.replace(LOG_DIR / f"{name}.{i + 1}")
+                p.replace(LOG_DIR / f"{name}.1")
+                rotated.append(name)
+                done = True
+                break
+            except Exception as e:
+                if attempt == 2:
+                    # 文件还被占着 -> 退化成截断
+                    try:
+                        with open(p, "r+b"):
+                            pass
+                        os.truncate(str(p), 0)
+                        truncated.append(name)
+                        done = True
+                    except Exception as e2:
+                        log(f"滚动 {name} 失败: {e} / 截断也失败: {e2}")
+                else:
+                    time.sleep(0.5)
     if rotated:
         log(f"日志已滚动: {', '.join(rotated)} (阈值 {max_bytes // 1024 // 1024}MB)")
-    return rotated
+    if truncated:
+        log(f"日志被占用无法改名, 已截断: {', '.join(truncated)}")
+    return rotated + truncated
 
 
 # ============================================================
