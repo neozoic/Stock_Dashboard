@@ -117,12 +117,56 @@ def commit_and_push():
     return True
 
 
+def remote_ahead_count(remote):
+    """本地 main 比远端领先几个 commit；拿不到远端信息时返回 None"""
+    code, out, _ = run_git(["rev-list", "--count", f"{remote}/main..main"])
+    if code == 0:
+        try:
+            return int(out.strip() or 0)
+        except ValueError:
+            return None
+    # 本地没有 remote/main 引用时，用 ls-remote 兜底
+    code, out, _ = run_git(["ls-remote", remote, "refs/heads/main"])
+    if code != 0 or not out.strip():
+        return None
+    remote_sha = out.split()[0]
+    code, out2, _ = run_git(["rev-list", "--count", f"{remote_sha}..main"])
+    if code != 0:
+        return None
+    try:
+        return int(out2.strip() or 0)
+    except ValueError:
+        return None
+
+
+def push_unpushed():
+    """推送"已提交但未推送"的 commit。
+
+    auto_sync 只在检测到未提交改动时才 commit+push, 所以手工 commit 的
+    commit 会被漏掉, 一直卡在本地。这里单独补一次推送。
+    """
+    pushed = False
+    for remote in PUSH_REMOTES:
+        n = remote_ahead_count(remote)
+        if not n:
+            continue
+        log(f"push {remote} ({n} 个已提交未推送)")
+        code, out, err = run_git(["push", remote, "main"])
+        if code == 0:
+            log(f"  -> {remote} 推送成功")
+            pushed = True
+        else:
+            log(f"  -> {remote} 推送失败: {err[:200]}")
+    return pushed
+
+
 def main_loop():
     log(f"auto_sync 启动: 监控 {PROJECT_DIR}")
     log(f"  阈值: files >= {MIN_FILES} 或 lines >= {MIN_LINES}, debounce {DEBOUNCE_SECONDS}s")
 
     last_change_time = None
     last_summary = (0, 0)
+    idle_ticks = 0
 
     try:
         while True:
@@ -132,6 +176,7 @@ def main_loop():
                     log(f"检测到变动: {fc} 文件, {ld} 行 (待 debounce)")
                     last_summary = (fc, ld)
                 last_change_time = time.time()
+                idle_ticks = 0
             else:
                 # 无变动
                 if last_change_time and (time.time() - last_change_time) > DEBOUNCE_SECONDS:
@@ -142,6 +187,11 @@ def main_loop():
                         log(f"变动未达阈值,跳过: {last_summary}")
                     last_change_time = None
                     last_summary = (0, 0)
+                else:
+                    # 空闲时顺手补推"已提交未推送"的 commit (约每 5 分钟一次)
+                    idle_ticks += 1
+                    if idle_ticks % 10 == 0:
+                        push_unpushed()
             time.sleep(CHECK_INTERVAL)
     except KeyboardInterrupt:
         log("用户中断,退出")
@@ -163,5 +213,7 @@ if __name__ == "__main__":
             log(f"变动未达阈值(已配置: files>={MIN_FILES} lines>={MIN_LINES}): {fc} 文件 / {ld} 行,跳过")
         else:
             log("无变动")
+        # 补推已提交但未推送的 commit
+        push_unpushed()
     else:
         main_loop()
