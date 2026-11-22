@@ -354,21 +354,18 @@ def ensure_tdx_logged_in(wait: int = 90) -> bool:
 def tdx_tq_ready(timeout: int = 45) -> bool:
     """探 TQ 接口是否就绪。
 
-    刻意做得比 tdx_client._test_tdx_init() 更轻：
-      - 只试 mode=1（看板用的就是 mode 1），不遍历 [1,2,3,0]
-        —— 通达信对每个 mode 槽位有限制，反复 init/close 会烧掉槽位
-      - 不显式 close，进程退出自然释放连接
     必须在独立子进程里探：watchdog 进程不能自己占 TQ 槽位，
     否则会把看板正在用的槽位挤掉。
+
+    mode 必须遍历 [1,2,3,0]（复用 tdx_client._test_tdx_init）：
+    通达信每个 mode 只有一个槽位，被占用/耗尽后返回"初始化失败"，
+    只试单个 mode 会误报"未就绪"（实测 mode 1/2/3 可被耗尽，
+    只剩 mode 0 可用）。
     """
     code = (
         f"import sys; sys.path.insert(0, {str(PROJECT_DIR)!r});"
         "import tdx_client as t;"
-        "import tqcenter;"
-        "sys.argv=[sys.argv[0],'--run_tdx','1'];"
-        "tqcenter.tq.initialize(t._TDX_EXE, dll_path=t._TDX_DLL);"
-        "snap=tqcenter.tq.get_market_snapshot('600519.SH');"
-        "sys.exit(0 if snap and 'Now' in snap else 1)"
+        "sys.exit(0 if t._test_tdx_init() else 1)"
     )
     env = os.environ.copy()
     env.setdefault("TDX_HOME", str(TDX_HOME))
@@ -455,8 +452,9 @@ def main() -> int:
         health = dashboard_health()
         tdx_state = health.get("tdx_health")
         if tdx_state == "ok":
-            if st.get("tdx_fail_count"):
+            if st.get("tdx_fail_count") or st.get("needs_tdx_restart"):
                 st["tdx_fail_count"] = 0
+                st.pop("needs_tdx_restart", None)
                 save_state(st)
             log(f"看板正常 (port {DASHBOARD_PORT}, tdx_health=ok)", quiet=True)
             return 0  # 一切正常, 静默
