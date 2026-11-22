@@ -198,6 +198,13 @@ keepalive 的行为矩阵:
 - **限流**:15 分钟内最多重启 3 次(挡住崩溃循环的秒级重启)+ 1 小时内最多 10 次(防缓慢抖动)。
   旧版只看"1 小时内绝对次数",早上的重启记录会一直占着预算,导致看板稳定运行后
   一次正常杀进程也拉不起来。
+- **TQ 槽位会被"烧掉"**:通达信每个 mode(0/1/2/3) 只有一个槽位,持有它的进程被
+  强杀时槽位不释放(下次 `init` 直接返回"返回ID小于0")——每强杀一次看板就烧一个,
+  4 个烧光 TQ 就再也起不来。所以重启看板走 `POST /api/shutdown`(仅本机 loopback)
+  优雅退出:走 finally 分支 `tdx_client.close()` 正常归还槽位;退不掉才强杀。
+  万一槽位真的耗尽(探测失败但通达信已登录),keepalive 会重启通达信客户端重置槽位。
+- **人工调试也占预算**:自己手动重启看板几次后,keepalive 会判定为崩溃循环而拒绝拉起。
+  用 `python tools\dashboard_watchdog.py --reset-budget` 清空限流计数并立即恢复服务。
 - **日志滚动**:业务日志 `logs\dashboard.log` 由看板自己的 RotatingFileHandler 轮转
   (8MB 一代,保留 3 代)。`dashboard.stdout.log` / `dashboard.stderr.log` 是外层重定向的
   应急输出,被看板占用时 Windows 改不了名 —— 此时只告警、**不截断**:截断会让写入方
@@ -213,6 +220,7 @@ keepalive 的行为矩阵:
 | `DASHBOARD_MAX_RESTARTS_BURST` | `3` | 突发窗口内最多重启次数(崩溃循环保护) |
 | `DASHBOARD_RESTART_BURST_WINDOW` | `900` | 突发窗口秒数(默认 15 分钟) |
 | `DASHBOARD_MAX_RESTARTS_PER_HOUR` | `10` | 每小时最多重启次数(防缓慢抖动) |
+| `DASHBOARD_MAX_TDX_RESTARTS_PER_HOUR` | `1` | 槽位耗尽时重启通达信客户端的次数上限 |
 
 ### 手动控制已注册任务
 ```cmd

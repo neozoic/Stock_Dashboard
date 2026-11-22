@@ -95,6 +95,21 @@ logger = logging.getLogger("dashboard")
 # 本机时区不是 Asia/Shanghai（A 股必须用北京时间判断交易时段 + 打时间戳）
 BJ_TZ = timezone(timedelta(hours=8))
 
+# 优雅关停钩子（由 main() 注入）：POST /api/shutdown 时触发，
+# 让 serve_forever 返回 → 走 finally 分支关线程 + tdx_client.close()。
+_SHUTDOWN_HOOK = None
+
+
+def _trigger_shutdown():
+    hook = _SHUTDOWN_HOOK
+    if hook is None:
+        logger.warning("收到关停请求但没有可用的钩子")
+        return
+    try:
+        hook()
+    except Exception as e:
+        logger.warning("优雅关停失败: %s", e)
+
 
 def bj_now() -> datetime:
     """获取当前北京时间（aware datetime）"""
@@ -1170,6 +1185,25 @@ class Handler(BaseHTTPRequestHandler):
         # 屏蔽 BaseHTTPRequestHandler 默认的 stderr access log（刷屏且无级别）
         pass
 
+    def do_POST(self):
+        """只提供优雅关停（仅限本机 loopback 调用）。
+
+        为什么需要它：通达信每个 TQ mode 只有一个槽位，持有它的进程被
+        强杀时槽位不会释放（init 直接返回"返回ID小于0"）——每重启一次看板
+        就烧掉一个槽位，4 个烧光后 TQ 就再也起不来。走优雅退出（关线程 +
+        tdx_client.close()）才会正常归还槽位。keepalive 重启看板前先调这里。
+        """
+        if self.path != "/api/shutdown":
+            self._send_json_response(404, {"ok": False, "code": 404, "error": "not_found"})
+            return
+        client_ip = self.client_address[0] if self.client_address else ""
+        if client_ip not in ("127.0.0.1", "::1", "::ffff:127.0.0.1"):
+            logger.warning("拒绝非本机的关停请求: %s", client_ip)
+            self._send_json_response(403, {"ok": False, "code": 403, "error": "forbidden"})
+            return
+        self._send_json_response(200, {"ok": True, "action": "shutdown"})
+        threading.Thread(target=_trigger_shutdown, daemon=True).start()
+
     def _send_json_response(self, status, payload, extra_headers=None):
         """统一 JSON 响应出口（含错误响应）。
 
@@ -1683,6 +1717,18 @@ def main(port=None, fetch_interval=180):
 
     srv = ThreadingHTTPServer((bind_host, port), Handler)
     print(f"  [OK] HTTP 服务启动: {bind_host}:{port}（线程化）", flush=True)
+
+    # 优雅关停：keepalive 重启看板前 POST /api/shutdown（仅本机），
+    # 让这里走 finally 分支正常退出 —— 归还通达信的 TQ 槽位，别被强杀烧掉
+    global _SHUTDOWN_HOOK
+
+    def _shutdown_hook():
+        try:
+            srv.shutdown()
+        except Exception:
+            pass
+
+    _SHUTDOWN_HOOK = _shutdown_hook
     try:
         srv.serve_forever()
     except KeyboardInterrupt:
@@ -1690,22 +1736,42 @@ def main(port=None, fetch_interval=180):
     finally:
         # 通知后台线程停
         stop_event.set()
-        # 关 HTTP
-        srv.shutdown()
+        # 关 HTTP（shutdown 停服务循环，server_close 才真正释放端口）
+        try:
+            srv.shutdown()
+        except Exception:
+            pass
+        try:
+            srv.server_close()
+        except Exception:
+            pass
         # 等后台线程（最多 10s）
+        stuck = []
         for name, th in [("background_loop", bg_thread),
                           ("period_background_loop", period_thread),
                           ("daily_snapshot_loop", daily_thread)]:
             th.join(timeout=10)
             if th.is_alive():
                 logger.warning("[stop] %s 未能在 10s 内退出，强制离开", name)
-        # 关 TDX 资源（如果有）
+                stuck.append(name)
+        # 关 TDX 资源（如果有）—— 这一步会归还通达信的 TQ 槽位，必须在强退前做
         if TDX_OK:
             try:
                 tdx_client.close()
             except Exception:
                 pass
         print("[stop] 退出完成", flush=True)
+        if stuck:
+            # 后台线程卡在 TQ 调用里退不出来时，它们是非守护线程 —— 解释器会
+            # 一直等它们，进程就永远不退出（端口也不释放，看着像"关了没关"）。
+            # 资源已经清理干净，这里直接结束进程。
+            print(f"[stop] {', '.join(stuck)} 未退出，强制结束进程", flush=True)
+            try:
+                sys.stdout.flush()
+                sys.stderr.flush()
+            except Exception:
+                pass
+            os._exit(0)
 
 
 if __name__ == "__main__":

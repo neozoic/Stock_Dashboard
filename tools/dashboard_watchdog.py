@@ -66,6 +66,8 @@ MAX_RESTARTS_BURST = int(os.environ.get("DASHBOARD_MAX_RESTARTS_BURST", 3))
 RESTART_BURST_WINDOW = int(os.environ.get("DASHBOARD_RESTART_BURST_WINDOW", 900))
 # 拉起通达信后等 TQ 接口就绪的最长时间（秒）
 TDX_READY_TIMEOUT = int(os.environ.get("DASHBOARD_TDX_READY_TIMEOUT", 120))
+# TQ 槽位耗尽时重启通达信客户端的限流（1 小时内最多几次）
+MAX_TDX_RESTARTS_PER_HOUR = int(os.environ.get("DASHBOARD_MAX_TDX_RESTARTS_PER_HOUR", 1))
 
 DETACHED_PROCESS = 0x00000008
 CREATE_NEW_PROCESS_GROUP = 0x00000200
@@ -241,6 +243,36 @@ def tdx_logged_in() -> bool:
     return False
 
 
+def kill_tdx_client() -> int:
+    """结束通达信客户端进程。
+
+    用途：重置 TQ 的 mode 槽位。通达信每个 mode(0/1/2/3) 只有一个槽位，
+    持有它的进程被强杀时槽位不会释放（实测：看板在 mode=2 被杀后，
+    mode=2 的 init 直接返回"返回ID小于0"）——每重启一次看板就烧掉一个槽位，
+    4 个烧光后 TQ 就再也起不来了。只有重启通达信客户端才能重置槽位。
+    """
+    killed = 0
+    for pid in tdx_pids():
+        try:
+            subprocess.run(
+                ["taskkill", "/PID", str(pid), "/F"],
+                capture_output=True, text=True, encoding="utf-8", errors="replace", timeout=15,
+            )
+            log(f"已结束通达信进程 PID={pid}")
+            killed += 1
+        except Exception as e:
+            log(f"结束通达信 PID={pid} 失败: {e}")
+    return killed
+
+
+def tdx_slot_reset_allowed(st: dict) -> bool:
+    """重启通达信客户端的限流（1 小时内最多 N 次）"""
+    now = time.time()
+    recent = [float(t) for t in st.get("tdx_restarts", []) if now - float(t) < 3600]
+    st["tdx_restarts"] = recent
+    return len(recent) < MAX_TDX_RESTARTS_PER_HOUR
+
+
 # ============================================================
 # 端口残留清理
 # ============================================================
@@ -278,6 +310,43 @@ def kill_port_listeners(port: int) -> int:
         except Exception as e:
             log(f"结束 PID={pid} 失败: {e}")
     return killed
+
+
+def request_shutdown(port: int = DASHBOARD_PORT, timeout: float = 15.0) -> bool:
+    """请求看板优雅退出（POST /api/shutdown，仅本机）。
+
+    意义：通达信每个 TQ mode 只有一个槽位，持有它的进程被强杀时槽位不会
+    释放（实测看板在 mode=2 被 taskkill 后，mode=2 的 init 直接返回
+    "返回ID小于0"）——每重启一次看板就烧掉一个槽位，4 个烧光 TQ 就再也
+    起不来。优雅退出会走 tdx_client.close()，槽位能正常归还。
+    """
+    import urllib.request
+    try:
+        req = urllib.request.Request(
+            f"http://127.0.0.1:{port}/api/shutdown", data=b"", method="POST"
+        )
+        with urllib.request.urlopen(req, timeout=timeout) as r:
+            return r.status == 200
+    except Exception:
+        return False
+
+
+def stop_dashboard(port: int = DASHBOARD_PORT, wait: int = 45) -> int:
+    """停掉看板：先请求优雅退出（归还 TQ 槽位），超时再强杀残留。
+
+    等的是"端口释放"而不是"健康检查失败"——优雅退出时服务循环先停、
+    进程随后才真正退出，只看健康检查会以为已经退干净，结果新实例绑不上端口。
+
+    返回被强杀的进程数（0 表示优雅退出成功或本来就没进程）。
+    """
+    if request_shutdown(port):
+        log("[ACTION] 已请求看板优雅退出（归还 TQ 槽位）")
+        for _ in range(max(1, wait // 2)):
+            if not port_listener_pids(port):
+                return 0
+            time.sleep(2)
+        log("[WARN] 看板优雅退出超时，改为强杀")
+    return kill_port_listeners(port)
 
 
 # ============================================================
@@ -535,8 +604,19 @@ def main() -> int:
             if not restart_budget_ok(st):
                 log(f"[WARN] 重启次数超限({RESTART_BURST_WINDOW}s 内 {MAX_RESTARTS_BURST} 次 / 1h 内 {MAX_RESTARTS_PER_HOUR} 次)，放弃自愈，等人工介入")
                 return 0
+            # 重启看板前先确认 TQ 槽位还够用：槽位被烧光时重启看板只会
+            # 再烧一个（还起不来），此时该做的是重启通达信重置槽位
+            if not tdx_tq_ready(timeout=40) and tdx_slot_reset_allowed(st):
+                log("[ACTION] TQ 探测失败（疑似 mode 槽位耗尽），先重启通达信重置槽位")
+                kill_tdx_client()
+                time.sleep(3)
+                start_tdx_client()
+                ensure_tdx_logged_in()
+                st.setdefault("tdx_restarts", []).append(time.time())
+                save_state(st)
+                wait_for_tdx_ready()
             log("[ACTION] TQ 连续异常，重启看板进程")
-            kill_port_listeners(DASHBOARD_PORT)
+            stop_dashboard()
             record_restart(st)
             st["tdx_fail_count"] = 0
             save_state(st)
@@ -547,8 +627,8 @@ def main() -> int:
     # ---- 情况 2: 看板死了 ----
     log(f"看板({DASHBOARD_PORT}) 未响应")
 
-    # 端口上可能还挂着不健康的僵尸实例，先清掉
-    if kill_port_listeners(DASHBOARD_PORT):
+    # 端口上可能还挂着不健康的僵尸实例，先清掉（活着就优雅退，退不掉再强杀）
+    if stop_dashboard():
         time.sleep(2)
 
     if not tdx_alive():
@@ -564,6 +644,24 @@ def main() -> int:
     # 拉看板之前先探 TQ 是否就绪 —— 否则看板第一次 init 失败会把进程内 TQ 状态毒化
     if wait_for_tdx_ready():
         st.pop("needs_tdx_restart", None)
+    elif tdx_logged_in() and tdx_slot_reset_allowed(st):
+        # 通达信已登录但 TQ 探测失败 —— 大概率是 mode 槽位被烧光
+        # （看板被强杀会漏掉槽位，每重启一次看板烧一个，4 个烧光 TQ 就再也起不来）
+        # 只有重启通达信客户端才能重置槽位
+        log("[ACTION] 通达信已登录但 TQ 探测失败，判定为 mode 槽位耗尽，"
+            "重启通达信客户端重置槽位")
+        kill_tdx_client()
+        time.sleep(3)
+        start_tdx_client()
+        ensure_tdx_logged_in()
+        st.setdefault("tdx_restarts", []).append(time.time())
+        save_state(st)
+        if wait_for_tdx_ready():
+            st.pop("needs_tdx_restart", None)
+            log("[OK] 重启通达信后 TQ 已就绪")
+        else:
+            log("[WARN] 重启通达信后 TQ 仍未就绪 —— 看板先走 akshare 兜底")
+            st["needs_tdx_restart"] = True
     else:
         log("[WARN] TQ 接口未就绪 —— 看板会先走 akshare 兜底，"
             "TQ 就绪后下一轮会重启看板以修复 TQ")
@@ -580,6 +678,16 @@ def main() -> int:
 
 
 if __name__ == "__main__":
+    # 运维开关：--reset-budget 清空重启限流计数。
+    # 人工重启（调试/升级）也会被记进崩溃自愈的预算里，连续几次之后
+    # keepalive 就会以为在崩溃循环而拒绝拉起 —— 人工介入后用它解锁。
+    if "--reset-budget" in sys.argv:
+        st = load_state()
+        st["restarts"] = []
+        st["tdx_restarts"] = []
+        st["tdx_fail_count"] = 0
+        save_state(st)
+        log("[ACTION] 重启限流计数已清空")
     if not acquire_lock():
         sys.exit(0)
     try:
