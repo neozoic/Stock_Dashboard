@@ -552,13 +552,29 @@ class RealtimeAlertMonitor:
             # 原来无条件打印"订阅成功"并写入 _subscribed，状态与实际不符，
             # 排障时极具误导（巡检 P2-13）。
             if not res:
+                # 连接刚重建时 DLL 还没就绪，第一次订阅常失败 —— 等一下重试一次
+                logger.warning("订阅返回空结果，2s 后重试（%d 只）", len(codes))
+                time.sleep(2)
+                res = self._tq.subscribe_hq(stock_list=codes, callback=on_data)
+            if not res:
                 logger.error("订阅失败：tqcenter 返回空结果（%d 只未订阅）", len(codes))
                 return
             with self._lock:
                 self._subscribed.update(codes)
             logger.info("订阅成功: %d 只", len(codes))
         except Exception as e:
-            logger.error("订阅失败: %s", e)
+            logger.warning("订阅异常，2s 后重试: %s", e)
+            time.sleep(2)
+            try:
+                res = self._tq.subscribe_hq(stock_list=codes, callback=on_data)
+                if res:
+                    with self._lock:
+                        self._subscribed.update(codes)
+                    logger.info("重试后订阅成功: %d 只", len(codes))
+                else:
+                    logger.error("重试后订阅仍失败（%d 只未订阅）", len(codes))
+            except Exception as e2:
+                logger.error("重试后订阅异常: %s", e2)
 
     def start(self):
         """启动后台监测线程（订阅线程 + 兜底扫描线程）"""
@@ -634,6 +650,8 @@ class RealtimeAlertMonitor:
                 if gen != last_generation:
                     last_generation = gen
                     logger.warning("TQ 连接已重建（generation=%s），重新订阅实时行情", gen)
+                    # 连接刚重建时 DLL 还没完全就绪，立刻订阅会抛异常
+                    time.sleep(3)
                     with self._lock:
                         codes = list(self._hot_watchlist)
                     self._subscribe(codes)
@@ -680,6 +698,21 @@ class RealtimeAlertMonitor:
         if not to_scan:
             return
 
+        # TQ 优先权：看板主拉数有优先权。这里拿不到锁就**跳过本轮**，
+        # 不跟看板抢连接 —— 抢的结果是两边都失败：
+        # 看板拉数被饿死 → 健康缓存 fail → keepalive 误判 → 重启看板
+        # （2026-11-23 01:00 交易时段实测）
+        if not tdx_client.acquire_tq(priority=False):
+            logger.debug("TQ 正被看板拉数占用，跳过本轮扫描")
+            return
+        try:
+            self._scan_full_market_once_locked(to_scan)
+        finally:
+            tdx_client.release_tq()
+
+    def _scan_full_market_once_locked(self, to_scan: List[str]):
+        """已持有 TQ 优先权后的实际扫描"""
+        import tdx_client
         # 游标轮转：本轮从上次停下的位置继续
         cursor = int(self._scan_cursor or 0)
         if cursor >= len(to_scan):

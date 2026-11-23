@@ -157,6 +157,40 @@ def _wait_inflight_drain(timeout: float = 5.0) -> bool:
     return _inflight_count() == 0
 
 
+# ============================================================
+# TQ 优先锁
+# ============================================================
+# 看板主拉数 和 告警兜底扫描 用的是同一条 TQ 连接。告警扫描每分钟打 ~5000 次
+# TQ 调用, 会把看板自己的拉数饿死 → 拉数失败 → 健康缓存变 fail →
+# keepalive 连续 3 次误判 → 重启看板（2026-11-23 01:00 实测发生，交易时段）。
+# 这里给"看板主拉数"优先权: 扫描拿不到锁就跳过本轮, 不跟看板抢连接。
+TQ_BUSY_LOCK = threading.Lock()
+
+
+def acquire_tq(priority: bool = True, timeout: float = 0.0) -> bool:
+    """占用 TQ。
+
+    priority=True  → 等最多 timeout 秒（看板主拉数用）
+    priority=False → 拿不到就立刻返回 False（告警扫描用，让路给看板）
+    """
+    if priority:
+        return TQ_BUSY_LOCK.acquire(timeout=timeout) if timeout > 0 else TQ_BUSY_LOCK.acquire()
+    return TQ_BUSY_LOCK.acquire(blocking=False)
+
+
+def release_tq() -> None:
+    try:
+        TQ_BUSY_LOCK.release()
+    except RuntimeError:
+        pass
+
+
+def tq_busy() -> bool:
+    """TQ 当前是否被占用（用于区分"连接忙"与"连接坏"）"""
+    locked = TQ_BUSY_LOCK.locked()
+    return locked or _inflight_count() > 0
+
+
 def _check_tdx_process_alive() -> Optional[bool]:
     """
     检查通达信客户端进程是否在运行。
@@ -365,11 +399,22 @@ def init(force: bool = False, auto_start: bool = True) -> bool:
         # 先释放旧连接（显式绕过 _safe_close 的吞掉逻辑）。
         # 判据用 tqcenter 自己的"真实连接"标志，而不是本模块的 _initialized ——
         # 超时路径会把 _initialized 置 False，但真实连接还活着（这正是槽位泄漏的来源）。
-        # 且只有在没有在途 TQ 调用时才能关：对活跃连接 CloseConnect 会让通达信
-        # 客户端写回共享内存时命中失效句柄 → TdxW.exe 访问冲突崩溃
-        # （2026-11-22 实测 Event ID 1000 / 0xc0000005），也会打断告警订阅。
         real_open = bool(getattr(tq, "_initialized", False))
+        if real_open and not force:
+            # **已有可用连接就复用，不要关掉重开**：
+            #   ① 关掉重开白烧一个 TQ mode 槽位；
+            #   ② 更要命的是会把**已经注册在这条连接上的实时订阅**作废 ——
+            #      告警线程刚订阅完，主拉数这边再 init 一次，订阅就掉了
+            #      （2026-11-23 01:18 实测：订阅成功后立刻"连接已重建"→ 重订阅失败）
+            _initialized = True
+            _last_init_time = now
+            logger.info("复用已有 TdxQuant 连接 (mode=%s, run_id=%s)",
+                        getattr(tq, "run_mode", "?"), getattr(tq, "run_id", "?"))
+            return True
         if real_open or _initialized:
+            # 只有在没有在途 TQ 调用时才能关：对活跃连接 CloseConnect 会让通达信
+            # 客户端写回共享内存时命中失效句柄 → TdxW.exe 访问冲突崩溃
+            # （2026-11-22 实测 Event ID 1000 / 0xc0000005），也会打断告警订阅。
             if not _wait_inflight_drain(timeout=5.0):
                 logger.warning(
                     "仍有 %d 个在途 TQ 调用，跳过本次连接重建"
@@ -839,6 +884,21 @@ def get_minute_bars(stock_list, period: str = "1m", count: Optional[int] = None,
 _SEND_FAIL = object()  # 哨兵：区分"调用成功但返回 None"与"超时/异常"
 
 
+def _warn_num(v, fmt="%.2f") -> str:
+    """tqcenter 的 send_warn 各列表要求**字符串**。
+
+    get_warn_struct_str 里是 `",".join(price_list[:count])` —— 传 float/int 会直接
+    TypeError: expected str instance, float found（2026-11-23 实测）。
+    """
+    try:
+        f = float(v)
+    except (TypeError, ValueError):
+        return "0"
+    if f != f:
+        return "0"
+    return fmt % f
+
+
 def send_warn_signals(stock_list, time_list, price_list, bs_flag_list,
                       close_list, reason_list, volum_list=None) -> bool:
     """
@@ -865,25 +925,42 @@ def send_warn_signals(stock_list, time_list, price_list, bs_flag_list,
     if volum_list is None:
         volum_list = ["0"] * n
     else:
-        volum_list = [str(v if v is not None else 0) for v in volum_list]
+        volum_list = [_warn_num(v, "%.0f") for v in volum_list]
         if len(volum_list) < n:
             volum_list = volum_list + ["0"] * (n - len(volum_list))
-    res = _call_with_timeout(
-        tq.send_warn,
-        stock_list=list(stock_list),
-        time_list=list(time_list),
-        price_list=[float(p or 0) for p in price_list],
-        bs_flag_list=[int(b) for b in bs_flag_list],
-        close_list=[float(c or 0) for c in close_list],
-        volum_list=volum_list[:n],
-        reason_list=[str(r) for r in reason_list],
-        count=n,
-        default=_SEND_FAIL,
-        label=f"send_warn({n} signals)",
-    )
-    if res is _SEND_FAIL:
-        # 失败要记 warning 而不是 debug —— 原来用 debug，故障完全不可见
-        logger.warning("send_warn 失败（%d 条信号未送达 TQ 信号窗口）", n)
+    # 自己起线程而不是走 _call_with_timeout —— 为了把**真实异常**记进日志
+    # (原来只记 "失败" 两字，根因完全不可见，2026-11-23 才抓到 TypeError)
+    box = {}
+
+    def _runner():
+        _inflight_enter()
+        try:
+            box["v"] = tq.send_warn(
+                stock_list=[str(c) for c in stock_list],
+                time_list=[str(t) for t in time_list],
+                # 下面几个必须是字符串：tqcenter 用 ",".join(...) 拼装
+                price_list=[_warn_num(p) for p in price_list],
+                bs_flag_list=[str(int(b)) for b in bs_flag_list],
+                close_list=[_warn_num(c) for c in close_list],
+                volum_list=volum_list[:n],
+                reason_list=[str(r) for r in reason_list],
+                count=n,
+            )
+        except Exception as e:
+            box["e"] = e
+        finally:
+            _inflight_exit()
+
+    th = threading.Thread(target=_runner, daemon=True)
+    th.start()
+    th.join(TDX_CALL_TIMEOUT)
+    if th.is_alive():
+        logger.warning("send_warn 超时（%.1fs），%d 条信号未送达 TQ 信号窗口",
+                       TDX_CALL_TIMEOUT, n)
+        return False
+    if "e" in box:
+        logger.warning("send_warn 异常（%d 条信号未送达）: %s: %s",
+                       n, type(box["e"]).__name__, box["e"])
         return False
     return True
 

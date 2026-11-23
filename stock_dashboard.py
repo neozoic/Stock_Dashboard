@@ -220,6 +220,8 @@ FETCH_LOCK = threading.Lock()
 # 误报成 tdx_health=fail → keepalive 连续 3 次后重启看板 → 再烧一个 TQ 槽位。
 # 取值：ok / fail(真故障) / busy(正在扫描) / idle(非交易时段) / unknown(还没拉过)
 TDX_HEALTH = {"state": "unknown", "updated": 0.0, "error": None, "ts": None}
+# TQ 连续失败计数（单轮失败不判死，见 fetch_once 里的说明）
+_TDX_FAIL_STREAK = {"n": 0}
 
 
 def _set_tdx_health(state: str, error=None) -> None:
@@ -880,6 +882,12 @@ def _fetch_via_tdx(now):
     if not TDX_OK:
         return snapshot, False, False
     tdx_no_fund_flow = False
+    # 抢占 TQ 优先权（最多等 30s）—— 告警兜底扫描每分钟打 ~5000 次 TQ 调用，
+    # 会把看板自己的拉数饿死（2026-11-23 01:00 实测：拉数失败 → 健康缓存 fail
+    # → keepalive 连续 3 次误判 → 交易时段重启看板）
+    if not tdx_client.acquire_tq(priority=True, timeout=30):
+        logger.warning("[bg] 等不到 TQ 优先锁（30s），本轮让位给告警扫描")
+        return snapshot, False, False
     try:
         stock_top, stock_bot, stock_err = fetch_individual_flows_tdx(top_n=DEFAULT_FETCH_STOCK_TOP_N)
         snapshot["stock_top"] = stock_top
@@ -911,6 +919,8 @@ def _fetch_via_tdx(now):
         logger.exception("通达信主路径失败，切换 akshare 兜底")
         _accumulate_error(snapshot, f"tdx[{_classify_error(e)}]", e)
         return snapshot, False, False
+    finally:
+        tdx_client.release_tq()
 
 
 def _fetch_via_akshare_fallback(snapshot):
@@ -1058,9 +1068,20 @@ def fetch_once():
         # tdx_used=True 即表示 TQ 连接可用 —— 资金流全 0 是 level-1 客户端的
         # 限制（不下发分类数据），不是连接故障，不能报 fail。
         if tdx_used:
+            _TDX_FAIL_STREAK["n"] = 0
             _set_tdx_health("ok")
         else:
-            _set_tdx_health("fail", error="TDX 未取到数据，已走 akshare 兜底")
+            # 单轮失败**不立即判死**：可能是 TQ 正忙（告警扫描占用）。
+            # 连续 2 轮失败才报 fail；再叠加 keepalive 自己的 3 次容忍，
+            # 真实故障要 6 轮拉数失败（约 18 分钟）才触发重启 —— 避免
+            # 交易时段因为偶发忙碌把看板重启掉（2026-11-23 01:00 实测）。
+            _TDX_FAIL_STREAK["n"] = int(_TDX_FAIL_STREAK.get("n", 0)) + 1
+            if _TDX_FAIL_STREAK["n"] < 2:
+                _set_tdx_health("busy", error="本轮 TQ 拉取失败（可能 TQ 正忙）")
+            elif tdx_client.tq_busy():
+                _set_tdx_health("busy", error="TQ 正被告警扫描占用")
+            else:
+                _set_tdx_health("fail", error="TDX 未取到数据，已走 akshare 兜底")
 
         # === 阶段 2+3：history 累积 + LATEST 替换，单 DATA_LOCK 内原子提交 ===
         _commit_snapshot_and_history(snapshot)
