@@ -413,7 +413,9 @@ class RealtimeAlertMonitor:
 
         # 轮询配置
         self.scan_interval_sec = 60     # 全市场扫描间隔（兜底层）
-        self.scan_chunk_size = 500      # 每次批量拉多少只的 fund_flow
+        self.scan_chunk_size = 200      # 每次批量拉多少只的 fund_flow
+        # 从 500 降到 200：单批持 TQ 锁的时间更短（~5s vs ~12s），
+        # 看板主拉数最多等 1~2 秒就能插进来（2026-11-23 01:58 修）
         # 扫描游标：每轮从上次停下的位置继续，保证全集都能轮到
         # （原来每轮都从 to_scan[0] 开始，而 to_scan 来自 set 迭代顺序，
         #  排在后面的约一半代码永远扫不到，巡检 P1-10）
@@ -698,20 +700,15 @@ class RealtimeAlertMonitor:
         if not to_scan:
             return
 
-        # TQ 优先权：看板主拉数有优先权。这里拿不到锁就**跳过本轮**，
-        # 不跟看板抢连接 —— 抢的结果是两边都失败：
-        # 看板拉数被饿死 → 健康缓存 fail → keepalive 误判 → 重启看板
-        # （2026-11-23 01:00 交易时段实测）
-        if not tdx_client.acquire_tq(priority=False):
-            logger.debug("TQ 正被看板拉数占用，跳过本轮扫描")
-            return
-        try:
-            self._scan_full_market_once_locked(to_scan)
-        finally:
-            tdx_client.release_tq()
+        # TQ 优先权：**按批持锁、批间让行**。
+        # 整轮持锁是不行的 —— 一轮 5000 只要几分钟，看板主拉数 30s 等不到就被饿死，
+        # 健康缓存变 fail → keepalive 连续 3 次误判 → 重启看板
+        # （2026-11-23 01:00 交易时段实测）。
+        # 改成每批（500 只）持一次锁，批与批之间释放 —— 看板最多等 1~2 秒就能插进来。
+        self._scan_full_market_once_batched(to_scan)
 
-    def _scan_full_market_once_locked(self, to_scan: List[str]):
-        """已持有 TQ 优先权后的实际扫描"""
+    def _scan_full_market_once_batched(self, to_scan: List[str]):
+        """按批扫描，每批独立持 TQ 锁，批间让行给看板"""
         import tdx_client
         # 游标轮转：本轮从上次停下的位置继续
         cursor = int(self._scan_cursor or 0)
@@ -727,14 +724,32 @@ class RealtimeAlertMonitor:
                 logger.info("本轮扫描终止（stop 或超过每轮时限）: %d/%d", i, len(ordered))
                 break
             chunk = ordered[i:i + self.scan_chunk_size]
+            # 每批独立持锁：拿不到就等一小会儿再试（看板正在拉数就让路），
+            # 批与批之间释放锁 —— 看板最多等 1~2 秒就能插进来
+            got = tdx_client.acquire_tq(priority=False)
+            if not got:
+                for _ in range(12):        # 最多等 ~12s
+                    if not self._running:
+                        return
+                    time.sleep(1)
+                    if tdx_client.acquire_tq(priority=False):
+                        got = True
+                        break
+            if not got:
+                logger.info("TQ 一直被看板占用，本轮扫描到此为止: %d/%d", i, len(ordered))
+                break
             try:
-                flows = tdx_client.batch_get_more_info(
-                    chunk, field_list=['Zjl', 'ZAF', 'Now', 'Fzhsl'],
-                    max_workers=4, timeout=45,
-                )
-            except Exception as e:
-                logger.warning("扫描 batch 失败: %s", e)
-                flows = []
+                try:
+                    flows = tdx_client.batch_get_more_info(
+                        chunk, field_list=['Zjl', 'ZAF', 'Now', 'Fzhsl'],
+                        max_workers=4, timeout=45,
+                    )
+                except Exception as e:
+                    logger.warning("扫描 batch 失败: %s", e)
+                    flows = []
+            finally:
+                tdx_client.release_tq()
+                time.sleep(0.3)   # 批间让行，让看板的拉数有机会插进来
             by_code = {f.get("code"): f for f in flows if f and f.get("code")}
             scanned += len(chunk)
 

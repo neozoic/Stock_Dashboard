@@ -885,8 +885,8 @@ def _fetch_via_tdx(now):
     # 抢占 TQ 优先权（最多等 30s）—— 告警兜底扫描每分钟打 ~5000 次 TQ 调用，
     # 会把看板自己的拉数饿死（2026-11-23 01:00 实测：拉数失败 → 健康缓存 fail
     # → keepalive 连续 3 次误判 → 交易时段重启看板）
-    if not tdx_client.acquire_tq(priority=True, timeout=30):
-        logger.warning("[bg] 等不到 TQ 优先锁（30s），本轮让位给告警扫描")
+    if not tdx_client.acquire_tq(priority=True, timeout=60):
+        logger.warning("[bg] 等不到 TQ 优先锁（60s），本轮让位给告警扫描")
         return snapshot, False, False
     try:
         stock_top, stock_bot, stock_err = fetch_individual_flows_tdx(top_n=DEFAULT_FETCH_STOCK_TOP_N)
