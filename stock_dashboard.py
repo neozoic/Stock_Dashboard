@@ -1366,8 +1366,16 @@ class Handler(BaseHTTPRequestHandler):
                 extra_headers={"WWW-Authenticate": "Bearer"},
             )
             return
+        # ---- 页面路由（一级导航 + 两个二级页）----
+        #   /        index.html      一级导航页
+        #   /fund    dashboard.html  二级：A 股资金流实时看板（降级）
+        #   /select  select.html    二级：综合选股（开盘倒计时组件在这里）
         if route == "/" or route == "/index.html":
+            self._serve_file("index.html", "text/html; charset=utf-8")
+        elif route == "/fund" or route == "/dashboard.html":
             self._serve_file("dashboard.html", "text/html; charset=utf-8")
+        elif route == "/select" or route == "/select.html":
+            self._serve_file("select.html", "text/html; charset=utf-8")
         elif route == "/api/data":
             self._serve_json()
         elif route == "/api/history":
@@ -1399,6 +1407,9 @@ class Handler(BaseHTTPRequestHandler):
             _STATIC_WHITELIST = {
                 "dashboard.html": "text/html; charset=utf-8",
                 "index.html": "text/html; charset=utf-8",
+                "select.html": "text/html; charset=utf-8",
+                "common.css": "text/css; charset=utf-8",
+                "clock.js": "application/javascript; charset=utf-8",
                 "echarts.min.js": "application/javascript; charset=utf-8",
                 "mock_data.js": "application/javascript; charset=utf-8",
                 "favicon.ico": "image/x-icon",

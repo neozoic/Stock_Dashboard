@@ -66,7 +66,9 @@ start_oneclick.bat
 
 - 业务日志写入 `logs\dashboard.log`(由 Python 自己轮转,保留 3 代);
   `logs\dashboard.stdout.log` / `logs\dashboard.stderr.log` 只收启动横幅与未捕获异常
-- 浏览器打开 `http://localhost:8765/`
+- 浏览器打开 `http://localhost:8765/`（一级导航页）
+  - `/fund` —— 二级：A 股资金流实时看板
+  - `/select` —— 二级：综合选股（含开盘时间指示器）
 
 > 手动启动只保证"这一次在跑"。想让看板在崩溃/重启后自动回来,见下面的
 > [自动守护(keepalive)](#自动守护keepalive)—— 装好后登录即自启,

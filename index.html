@@ -1,0 +1,76 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>量化终端</title>
+<link rel="stylesheet" href="common.css">
+<style>
+  .nav-grid {
+    display: grid; grid-template-columns: repeat(auto-fit, minmax(280px, 1fr));
+    gap: 14px; margin-top: 4px;
+  }
+  .nav-card {
+    display: block; text-decoration: none; color: inherit;
+    background: var(--card); border: 1px solid var(--border);
+    border-radius: var(--radius); padding: 20px 22px;
+    transition: border-color .18s ease, background .18s ease, transform .18s ease;
+  }
+  .nav-card:hover {
+    border-color: var(--border-hover); background: var(--card-hover);
+    transform: translateY(-1px);
+  }
+  .nav-title {
+    font-size: 15px; font-weight: 650; letter-spacing: .04em;
+    color: var(--text); margin-bottom: 8px;
+    display: flex; align-items: center; gap: 9px;
+  }
+  .nav-title::before {
+    content: ""; width: 3px; height: 15px; border-radius: 2px;
+    background: var(--accent); flex: none;
+  }
+  .nav-desc { font-size: 12px; color: var(--muted); line-height: 1.65; }
+  .nav-tag {
+    display: inline-block; margin-top: 12px; padding: 3px 9px;
+    border-radius: 999px; font-size: 10px; color: var(--muted);
+    border: 1px solid var(--border); background: rgba(255, 255, 255, .03);
+  }
+  .wrap { padding: 22px 18px 40px; max-width: 1100px; margin: 0 auto; }
+  .sec-title {
+    font-size: 11px; color: var(--muted); letter-spacing: .16em;
+    text-transform: uppercase; margin: 10px 0 12px;
+  }
+</style>
+</head>
+<body>
+<header class="topbar">
+  <div class="brand">
+    <span class="logo"></span>
+    <h1>量化终端</h1>
+    <span class="brand-sub">Quant Terminal</span>
+  </div>
+</header>
+
+<main class="wrap">
+  <div class="sec-title">二级页面</div>
+  <div class="nav-grid">
+    <a class="nav-card" href="/fund">
+      <div class="nav-title">A 股资金流实时看板</div>
+      <div class="nav-desc">
+        个股 / 行业 / 概念资金流 TOP 榜、大盘净流入趋势、实时异动监测。<br>
+        数据源：通达信 TdxQuant，失败时自动降级到 akshare。
+      </div>
+      <span class="nav-tag">资金流</span>
+    </a>
+    <a class="nav-card" href="/select">
+      <div class="nav-title">综合选股</div>
+      <div class="nav-desc">
+        多因子综合筛选。顶部保留开盘时间指示器（距 A 股 / 美股开盘倒计时）。<br>
+        <b>布局稍后设计</b>。
+      </div>
+      <span class="nav-tag">选股</span>
+    </a>
+  </div>
+</main>
+</body>
+</html>

@@ -1,0 +1,112 @@
+/* ============================================================
+   共享样式：设计令牌 + 顶栏 + 开盘倒计时组件
+   （由 dashboard.html / index.html / select.html 共用）
+   ============================================================ */
+
+  :root {
+    --bg: #0a0e15;
+    --card: #121722;
+    --card-hover: #151b28;
+    --border: rgba(255, 255, 255, .06);
+    --border-hover: rgba(255, 255, 255, .13);
+    --up: #f6465d;
+    --up-soft: #ff8a96;
+    --up-bg: rgba(246, 70, 93, .12);
+    --down: #2ebd85;
+    --down-soft: #4adea5;
+    --down-bg: rgba(46, 189, 133, .12);
+    --text: #e8ecf3;
+    --muted: #8b94a7;
+    --accent: #4f9cf9;
+    --radius: 12px;
+  }
+
+  /* ============ 顶栏 ============ */
+  .topbar {
+    position: sticky; top: 0; z-index: 100;
+    display: flex; justify-content: space-between; align-items: center;
+    gap: 12px; flex-wrap: wrap;
+    padding: 10px 18px;
+    background: rgba(10, 14, 21, .78);
+    backdrop-filter: blur(14px);
+    -webkit-backdrop-filter: blur(14px);
+    border-bottom: 1px solid var(--border);
+  }
+  .brand { display: flex; align-items: center; gap: 10px; min-width: 0; }
+  .logo {
+    width: 20px; height: 20px; border-radius: 6px; flex: none;
+    background: linear-gradient(135deg, var(--up) 0%, #b03a8b 55%, var(--accent) 100%);
+    box-shadow: 0 0 10px rgba(246, 70, 93, .35), inset 0 1px 0 rgba(255, 255, 255, .25);
+  }
+  .topbar h1 {
+    font-size: 15px; margin: 0; font-weight: 650; letter-spacing: .05em;
+    color: var(--text); white-space: nowrap;
+  }
+  .brand-sub {
+    font-size: 10px; color: var(--muted); letter-spacing: .14em;
+    text-transform: uppercase; white-space: nowrap;
+  }
+  .status { display: flex; gap: 8px; font-size: 12px; color: var(--muted); align-items: center; flex-wrap: wrap; }
+  .clock-group {
+    display: inline-flex; align-items: center; gap: 10px;
+    padding: 5px 12px; border-radius: 999px;
+    background: rgba(255, 255, 255, .035);
+    border: 1px solid var(--border);
+    line-height: 1.2;
+  }
+  .clock-state {
+    font-size: 11px; color: var(--muted);
+    display: inline-flex; align-items: center; gap: 5px; white-space: nowrap;
+  }
+  .clock-state .dot {
+    display: inline-block; width: 7px; height: 7px; border-radius: 50%;
+    background: #5b6373; flex: none;
+  }
+  .clock-group.is-open .clock-state .dot {
+    background: var(--down);
+    animation: dotBreath 2.2s ease-in-out infinite;
+  }
+  .clock-group.is-open .clock-state .state-text { color: var(--down-soft); }
+  @keyframes dotBreath {
+    0%, 100% { box-shadow: 0 0 0 0 rgba(46, 189, 133, .45); }
+    50% { box-shadow: 0 0 0 5px rgba(46, 189, 133, 0); }
+  }
+  .clock-col { display: inline-flex; flex-direction: column; gap: 0; }
+  .clock-time {
+    font-size: 12px; color: var(--text);
+    font-variant-numeric: tabular-nums; white-space: nowrap;
+  }
+  .clock-countdown {
+    font-size: 10px; color: var(--muted);
+    font-variant-numeric: tabular-nums; white-space: nowrap;
+  }
+  .clock-group.is-open .clock-countdown { color: var(--down-soft); }
+
+  @media (max-width: 480px) {
+    .brand-sub { display: none; }
+  }
+
+  /* ============ 页面基础（各页共用） ============ */
+  * { box-sizing: border-box; }
+  html, body { overflow-x: hidden; }
+  body {
+    margin: 0; padding: 0;
+    font-family: -apple-system, "Segoe UI", "PingFang SC", "Microsoft YaHei", sans-serif;
+    color: var(--text);
+    background:
+      radial-gradient(1100px 520px at 78% -8%, rgba(79, 156, 249, .07), transparent 60%),
+      radial-gradient(900px 480px at 8% -6%, rgba(246, 70, 93, .05), transparent 55%),
+      var(--bg);
+    background-attachment: fixed;
+  }
+
+
+  /* ============ 顶栏导航（各二级页共用） ============ */
+  .topnav { display: inline-flex; gap: 12px; align-items: center; }
+  .topnav-link {
+    font-size: 11.5px; color: var(--muted); text-decoration: none;
+    padding: 5px 11px; border-radius: 999px;
+    border: 1px solid var(--border); background: rgba(255, 255, 255, .03);
+    transition: color .16s ease, border-color .16s ease;
+  }
+  .topnav-link:hover { color: var(--text); border-color: var(--border-hover); }

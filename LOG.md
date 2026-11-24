@@ -122,7 +122,9 @@ A 股资金流实时看板：
 
 | 路径 | 方法 | 返回 | 缓存 |
 |---|---|---|---|
-| `/` | GET | `dashboard.html` | no-store |
+| `/` | GET | `index.html`（**一级导航页**）| no-store |
+| `/fund` | GET | `dashboard.html`（**二级：A 股资金流实时看板**）| no-store |
+| `/select` | GET | `select.html`（**二级：综合选股**，含开盘倒计时）| no-store |
 | `/api/health` | GET | `{tdx_client_available, akshare_available, current_source, last_timestamp, last_error, tdx_health}` | no-store |
 | `/api/data` | GET | `{timestamp, is_trading, stock_top/bottom, industry_top/bottom, concept_top/bottom, market_net, source}` | no-store |
 | `/api/history` | GET | 全量 history 时序（开发用）| no-store |
@@ -438,6 +440,7 @@ with DATA_LOCK:
 ---
 
 | 2026-11-22 | **全面巡检 + 四轮修复**（自主巡检，非用户驱动）。起因：07:35 看板与通达信同时哑火、08:19 重启后都没自启（同日第一轮加固的起因）。本轮做了三件事。**① 全面巡检**：3 个只读子代理分域审查（后端 / TQ 与告警 / 运维与安全）+ 主控侧运行期实测复核，产出 `AUDIT_2026-11-22.md`（已 gitignore，不进公开仓库）。**② 定位到一条自激故障链**：`tdx_client` 每 300s 强制重连 → 对活跃连接连续 CloseConnect → 通达信客户端写回共享内存时命中失效句柄 → **TdxW.exe 访问冲突崩溃**（实测 Event ID 1000 / 0xc0000005 / 10:00:57）→ 看板 TQ 调用挂死 → `/api/health` 的 3s 超时误报 `tdx_health=fail` → keepalive 连续 3 次后重启看板 → `close()` 被 `_initialized` 门控跳过 → **TQ 槽位不归还** → 下次 init 顺延 mode → 4 个烧光后 TQ 再也起不来。雪上加霜的是**两个 5 分钟调度器同时驱动同一份 keepalive**（Windows 计划任务 `Stock_Dashboard_KeepAlive` + hermes cron `看板 watchdog`，实测 10:10:01 / 10:10:36），把每次误判放大一倍。**③ 四批修复**。**B1 稳定性根因**：`close()` 改无条件真实关闭 + 拿锁带超时；取消 300s 强制重连，改为按需重建；`init()` 重建前等在途 TQ 调用归零（新增 `_inflight` 计数）、每个连接只 CloseConnect 一次；探针 `_test_tdx_init` 的 close 移进 `finally` 且不再关看板正在用的共享连接；`health_check` 加超时且超时不污染连接状态；`/api/health` 改读 `TDX_HEALTH` 缓存；关停路径 close 放独立线程限时等待 + `os._exit` 兜底前置；`ThreadingHTTPServer` 移进 try（原来 bind 失败会让 3 个非守护线程把进程挂死、槽位永不休）；非交易时段拉数降频到 1 小时；watchdog 超时与"跳过本轮"拆成两个计数器。**B2 keepalive 状态机**：新增看板"启动中"标记（防第二个触发源强杀刚拉起的实例）；健康语义区分 ok/fail/busy/idle/unknown（只把 fail 当故障）；限流检查前置到所有破坏性动作之前；只杀自己拉起的通达信 PID；状态文件原子写 + 备份；锁改 `msvcrt` 文件锁；端口清理校验进程身份；拉起失败不占重启预算；`--reset-budget` 改到拿锁之后再改状态。**B3 告警链路**：`send_warn` 补 `volum_list`（原来每次必失败）；新增 `batch_get_more_info` 替掉不存在的 `get_more_info_batch`；扫描游标轮转（原来后一半代码永远扫不到）；按 `tdx_client` 连接世代自动重订阅；接 akshare 交易日历排除法定节假日；Throttler 加日级去重；订阅返回值校验；`stop_event` 复位。**B4 前端**：各图加"口径"说明；`toTradingMin` 出域返回 null 并修正下午盘 30 分钟错位；休市显示"休市 / 非交易时段：暂无当日分时数据"空状态（原来是有坐标轴无曲线）；修分钟线"价格"轴被永久隐藏；`fetchData`/`fetchTrend` 加请求序号守卫；加 `visibilitychange` 补刷；标签"每 30s 一个点"改"每 3 分钟一点"。**B5 安全**：可选 Bearer token（`DASHBOARD_TOKEN`，默认关闭）；CORS 从 `*` 收敛为默认不发；静态资源 ETag/304；`.gitignore` 补 `.env`（防飞书 webhook 密钥被 auto_sync 推到公开仓库）。**验证**：`tools/smoke_test.py`（新增，24 项全过，含 `node --check` 前端语法检查）；强杀看板演练 → keepalive **15.7 秒**自愈且"TQ 接口已就绪 探测 1 次"；两道防线实测生效（`[SKIP] 另一个 watchdog 实例正在运行` / `看板正在启动中（177s 后再判定）`）；告警 `events_received` 从 **0 → 34**（订阅重建修复生效）；交易日历实测 2026-10-01/10-02/01-01 均判为非交易日。 |
+| 2026-11-23 | **多页重构**：原「A 股资金流实时看板」**降级为二级页面**，新增二级页「综合选股」，并新增一级导航页。**开盘时间指示器（距 A 股/美股开盘倒计时组件）搬到新的二级页「综合选股」**。页面结构：`/` → index.html（一级导航）；`/fund` → dashboard.html（二级·资金流）；`/select` → select.html（二级·综合选股，布局稍后设计）。**倒计时组件抽成共享文件**（`common.css` 设计令牌+顶栏+倒计时样式、`clock.js` 倒计时逻辑并自启动），三个页面共用不复制粘贴；dashboard.html 内联的倒计时代码已全部移除（其函数对缺失 DOM 本就 null-safe）。「下次刷新 10s」属数据刷新不是开盘倒计时，**留在资金流看板**。后端路由与静态白名单同步更新（新增 select.html / common.css / clock.js）。综合选股页目前只放倒计时组件 + 占位区，等布局设计。 |
 ## 15. 联系与维护
 
 - 看板作者：openclaw

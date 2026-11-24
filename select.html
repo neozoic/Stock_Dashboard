@@ -1,0 +1,62 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>综合选股</title>
+<link rel="stylesheet" href="common.css">
+<style>
+  .wrap { padding: 22px 18px 40px; max-width: 1400px; margin: 0 auto; }
+  .sec-title {
+    font-size: 11px; color: var(--muted); letter-spacing: .16em;
+    text-transform: uppercase; margin: 10px 0 12px;
+  }
+  .placeholder {
+    border: 1px dashed var(--border-hover); border-radius: var(--radius);
+    padding: 44px 24px; text-align: center; color: var(--muted);
+    font-size: 12.5px; line-height: 1.9;
+    background: rgba(255, 255, 255, .012);
+  }
+  .placeholder b { color: var(--text); font-weight: 600; }
+</style>
+</head>
+<body>
+<header class="topbar">
+  <div class="brand">
+    <span class="logo"></span>
+    <h1>综合选股</h1>
+    <span class="brand-sub">Stock Selection</span>
+  </div>
+  <div class="status">
+    <nav class="topnav">
+      <a class="topnav-link" href="/">首页</a>
+      <a class="topnav-link" href="/fund">资金流看板</a>
+    </nav>
+    <span class="clock-group" title="北京时间 (UTC+8)">
+      <span class="clock-state" id="cn-state"><span class="dot"></span><span class="state-text">CN 检测中</span></span>
+      <span class="clock-col">
+        <span class="clock-time">CN <span id="bj">--:--:--</span></span>
+        <span class="clock-countdown" id="cn-open">距开盘 --</span>
+      </span>
+    </span>
+    <span class="clock-group" title="纽约时间 (美东, 自动处理夏令时)">
+      <span class="clock-state" id="us-state"><span class="dot"></span><span class="state-text">US 检测中</span></span>
+      <span class="clock-col">
+        <span class="clock-time">US <span id="ny">--:--:--</span></span>
+        <span class="clock-countdown" id="us-open">距开盘 --</span>
+      </span>
+    </span>
+  </div>
+</header>
+
+<main class="wrap">
+  <div class="sec-title">综合选股</div>
+  <div class="placeholder">
+    <b>布局稍后设计</b><br>
+    开盘时间指示器（距 A 股 / 美股开盘倒计时）已在顶部就位。
+  </div>
+</main>
+
+<script src="clock.js"></script>
+</body>
+</html>
