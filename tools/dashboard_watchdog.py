@@ -39,6 +39,11 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 import tdx_login  # noqa: E402
 
+# 控制台程序(git/tasklist/netstat/taskkill/powershell)在 pythonw 父进程下
+# 会自己开一个黑色控制台窗口并抢焦点(2026-11-23 实测: auto_sync 每 30 秒
+# 弹一次)。CREATE_NO_WINDOW 让子进程静默运行，不占焦点。
+_NO_WINDOW = getattr(subprocess, "CREATE_NO_WINDOW", 0)
+
 # 用 abspath 而不是 resolve(): resolve() 会把映射盘 C:\Mac\Home 展开成 UNC
 # (\psf\Home\...), 后续 CreateProcess 用 UNC 当 cwd 更容易出问题
 PROJECT_DIR = Path(os.path.abspath(__file__)).parent.parent
@@ -267,6 +272,7 @@ def tdx_pids() -> list:
         r = subprocess.run(
             ["tasklist", "/FI", f"IMAGENAME eq {TDX_PROCESS}", "/NH"],
             capture_output=True, text=True, encoding="utf-8", errors="replace", timeout=5,
+            creationflags=_NO_WINDOW,
         )
     except Exception:
         return []
@@ -291,6 +297,7 @@ def _process_cmdline(pid: int) -> str:
             ["powershell", "-NoProfile", "-Command",
              f"(Get-CimInstance Win32_Process -Filter 'ProcessId={int(pid)}').CommandLine"],
             capture_output=True, text=True, encoding="utf-8", errors="replace", timeout=15,
+            creationflags=_NO_WINDOW,
         )
         return (r.stdout or "").strip()
     except Exception:
@@ -335,6 +342,7 @@ def kill_tdx_client(st: dict) -> int:
         subprocess.run(
             ["taskkill", "/PID", str(int(pid)), "/F"],
             capture_output=True, text=True, encoding="utf-8", errors="replace", timeout=15,
+            creationflags=_NO_WINDOW,
         )
         log(f"已结束通达信进程 PID={pid}")
         st.pop("tdx_pid", None)
@@ -360,7 +368,9 @@ def port_listener_pids(port: int) -> set:
     pids = set()
     try:
         r = subprocess.run(
-            ["netstat", "-ano", "-p", "tcp"], capture_output=True, text=True, encoding="utf-8", errors="replace", timeout=10
+            ["netstat", "-ano", "-p", "tcp"], capture_output=True, text=True, encoding="utf-8",
+            errors="replace", timeout=10,
+            creationflags=_NO_WINDOW,
         )
     except Exception:
         return pids
@@ -392,7 +402,8 @@ def kill_port_listeners(port: int) -> int:
             continue
         try:
             subprocess.run(["taskkill", "/PID", str(pid), "/F"],
-                           capture_output=True, text=True, encoding="utf-8", errors="replace", timeout=15)
+                           capture_output=True, text=True, encoding="utf-8", errors="replace",
+                           timeout=15, creationflags=_NO_WINDOW)
             log(f"已结束端口 {port} 的残留看板进程 PID={pid}")
             killed += 1
         except Exception as e:
@@ -596,6 +607,7 @@ def tdx_tq_ready(timeout: int = 45) -> bool:
             capture_output=True, text=True,
             encoding="utf-8", errors="replace",
             timeout=timeout,
+            creationflags=_NO_WINDOW,
         )
         return r.returncode == 0
     except Exception:

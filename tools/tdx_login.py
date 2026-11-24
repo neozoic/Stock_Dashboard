@@ -161,6 +161,8 @@ if __name__ == "__main__":
     out = subprocess.run(
         ["tasklist", "/FI", "IMAGENAME eq TdxW.exe", "/NH"],
         capture_output=True, text=True,
+        # 不弹控制台窗口（tasklist 是控制台程序，见 _NO_WINDOW 注释）
+        creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
     ).stdout
     pids = [int(x) for x in "".join(c if c.isdigit() else " " for c in out).split()]
     if not pids:

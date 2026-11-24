@@ -19,6 +19,11 @@ import datetime
 import sys
 from pathlib import Path
 
+# 控制台程序(git/tasklist/netstat/taskkill/powershell)在 pythonw 父进程下
+# 会自己开一个黑色控制台窗口并抢焦点(2026-11-23 实测: auto_sync 每 30 秒
+# 弹一次)。CREATE_NO_WINDOW 让子进程静默运行，不占焦点。
+_NO_WINDOW = getattr(subprocess, "CREATE_NO_WINDOW", 0)
+
 PROJECT_DIR = str(Path(__file__).resolve().parent.parent)
 MIN_FILES = 1
 MIN_LINES = 10
@@ -57,7 +62,8 @@ def log(msg):
 def run_git(args):
     r = subprocess.run(
         ["git", "-C", PROJECT_DIR] + args,
-        capture_output=True, text=True, encoding="utf-8", errors="replace"
+        capture_output=True, text=True, encoding="utf-8", errors="replace",
+        creationflags=_NO_WINDOW,
     )
     return r.returncode, r.stdout.strip(), r.stderr.strip()
 
