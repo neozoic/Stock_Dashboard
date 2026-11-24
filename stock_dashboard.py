@@ -368,12 +368,12 @@ def _get_full_market_data():
 
         # 一次拉所有 fund_flow（并发调低+串行重试避免触发通达信连接数限制）
         flows = tdx_client.batch_fund_flow(codes, max_workers=4, timeout=240)
-        # snapshot 是次要数据，fund_flow 够用就行，失败不阻塞
+        # 原来这里还批量拉一遍全市场 snapshot（5226 次 TQ 调用），
+        # 但结果只写进 _PERIOD_CACHE["stock_snaps"]、**从来没有被读过**
+        # （_format_stock_row 的 snapshot 参数也没人传）—— 纯浪费：
+        # 每轮多花约 30s，还挤占 TQ 连接（2026-11-22 巡检 P2-1）。
+        # 需要个股快照的地方走单只调用即可。
         snaps = []
-        try:
-            snaps = tdx_client.batch_snapshot(codes, max_workers=4, timeout=180)
-        except Exception:
-            pass
 
         _PERIOD_CACHE.update({
             "ts": now,
@@ -382,7 +382,7 @@ def _get_full_market_data():
             "stock_names": names,
             "all_codes": codes,
         })
-        logger.info("全 A 股数据缓存刷新: flows=%d snaps=%d", len(flows), len(snaps))
+        logger.info("全 A 股数据缓存刷新: flows=%d", len(flows))
     except Exception as e:
         logger.exception("_get_full_market_data 失败")
     return _PERIOD_CACHE
