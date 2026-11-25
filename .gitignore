@@ -61,3 +61,8 @@ _*.bat
 *.tmp
 *.bak
 *.swp
+
+# 指南针 0AMV 工具的运行时产物(快照/锁/中间文件)
+tools/compass_0amv/snapshots/
+tools/compass_0amv/*.lock
+tools/compass_0amv/verify_state.json

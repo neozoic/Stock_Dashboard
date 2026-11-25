@@ -228,10 +228,12 @@ _INDEX_PERIOD_SPEC = {
     "month": ("1mon", 300),
     "year": ("1d", 2500),
 }
-# 0AMV 多/空头区间（由 compass_0amv/daily_0amv.py 每日写出）
+# 0AMV 多/空头区间（由 tools/compass_0amv/daily_0amv.py 每日写出）
+# 用 __file__ 相对定位 —— 写死绝对路径的话，仓库换个位置就断
 OAMV_BANDS_FILE = os.environ.get(
     "OAMV_BANDS_FILE",
-    r"C:\Users\openclaw\Desktop\win_WorkSpace_ClaudeCode\compass_0amv\logs\0amv_bands.json")
+    os.path.join(os.path.dirname(os.path.abspath(__file__)),
+                 "tools", "compass_0amv", "logs", "0amv_bands.json"))
 
 DATA_LOCK = threading.Lock()
 FETCH_LOCK = threading.Lock()
