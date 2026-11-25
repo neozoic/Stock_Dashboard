@@ -59,13 +59,40 @@ def log(msg):
         pass
 
 
-def run_git(args):
-    r = subprocess.run(
-        ["git", "-C", PROJECT_DIR] + args,
-        capture_output=True, text=True, encoding="utf-8", errors="replace",
-        creationflags=_NO_WINDOW,
-    )
-    return r.returncode, r.stdout.strip(), r.stderr.strip()
+def run_git(args, retries=0, retry_delay=8):
+    """跑一条 git 命令。
+
+    retries>0 时失败会**重试**（指数退避）—— github.com 的连接会成片抽风
+    （实测同一时刻裸 curl https://github.com/ 返回 000，DNS 稳定、
+    api/codeload/raw 都正常，是那个 CDN 节点 57.155.223.240 偶发拥塞）。
+    没有重试的话，每次抖动都会让 push 失败、只能等下一轮 5 分钟。
+    """
+    last = (1, "", "")
+    for attempt in range(retries + 1):
+        r = subprocess.run(
+            ["git", "-C", PROJECT_DIR] + args,
+            capture_output=True, text=True, encoding="utf-8", errors="replace",
+            creationflags=_NO_WINDOW,
+            timeout=180,
+        )
+        last = (r.returncode, r.stdout.strip(), r.stderr.strip())
+        if last[0] == 0:
+            return last
+        if attempt < retries:
+            wait = retry_delay * (attempt + 1)
+            log("  git %s 失败(%d)，%ds 后重试 (%d/%d): %s"
+                % (" ".join(args), last[0], wait, attempt + 1, retries,
+                   (last[2] or "")[:120]))
+            time.sleep(wait)
+    return last
+
+
+def run_git_push(remote):
+    """推送到指定远端，带重试。
+
+    github.com 的连接会成片抽风（实测），不重试的话每次抖动都白丢一次推送。
+    """
+    return run_git(["push", remote, "main"], retries=3, retry_delay=10)
 
 
 def get_pending_changes():
@@ -115,7 +142,7 @@ def commit_and_push():
 
     for remote in PUSH_REMOTES:
         log(f"push {remote} ...")
-        code, out, err = run_git(["push", remote, "main"])
+        code, out, err = run_git_push(remote)
         if code == 0:
             log(f"  -> {remote} 推送成功")
         else:
@@ -157,7 +184,7 @@ def push_unpushed():
         if not n:
             continue
         log(f"push {remote} ({n} 个已提交未推送)")
-        code, out, err = run_git(["push", remote, "main"])
+        code, out, err = run_git_push(remote)
         if code == 0:
             log(f"  -> {remote} 推送成功")
             pushed = True
