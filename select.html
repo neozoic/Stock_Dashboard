@@ -212,6 +212,8 @@
   var state = null;     // 当前区间状态
   var latest = null;    // 最新一天的 活跃/死筹/活跃占比
   var stateDays = null; // 当前区间已持续几个交易日
+  var dailyMap = null;  // 日期 -> {close, chg}  0AMV 全量日线
+  var bandMap = null;   // 日期 -> 区间类型（多头区间/空头波段）
   var cur = { code: "000001.SH", period: "day" };
 
   function fmtDate(yyyymmdd) {
@@ -226,6 +228,69 @@
   }
 
   function clsFor(x) { return x > 0 ? "up" : (x < 0 ? "down" : "mute"); }
+
+  function fmtNum(x) {
+    if (x === null || x === undefined || isNaN(x)) return "--";
+    return Number(x).toFixed(2);
+  }
+
+  // 建立 日期->{close, chg} 与 日期->区间类型 两张查表
+  function buildLookups(daily, bandList) {
+    var dm = {};
+    if (daily && daily.length) {
+      for (var i = 0; i < daily.length; i++) {
+        var d = daily[i];
+        dm[String(d[0]).replace(/-/g, "")] = { close: d[1], chg: d[2] };
+      }
+    }
+    var bm = {};
+    if (bandList && bandList.length) {
+      for (var j = 0; j < bandList.length; j++) {
+        var b = bandList[j];
+        var s = String(b.start).replace(/-/g, "");
+        var e = String(b.end || b.start).replace(/-/g, "");
+        // 区间可能很长，遍历写入；8250 天 × 650 段的最坏情况也不到百万次
+        for (var dnum = s; dnum <= e; dnum = nextDateStr(dnum)) {
+          bm[dnum] = b.type;
+          if (dnum === e) break;
+        }
+      }
+    }
+    dailyMap = dm;
+    bandMap = bm;
+  }
+
+  // YYYYMMDD -> 下一天（纯字符串进位，避开 datetime）
+  function nextDateStr(s) {
+    var y = parseInt(s.slice(0, 4), 10);
+    var m = parseInt(s.slice(4, 6), 10);
+    var d = parseInt(s.slice(6, 8), 10);
+    var days = [31, 28, 31, 30, 31, 30, 31, 31, 30, 31, 30, 31];
+    if ((y % 4 === 0 && y % 100 !== 0) || y % 400 === 0) days[1] = 29;
+    d += 1;
+    if (d > days[m - 1]) { d = 1; m += 1; }
+    if (m > 12) { m = 1; y += 1; }
+    var p2 = function (v) { return (v < 10 ? "0" : "") + v; };
+    return String(y) + p2(m) + p2(d);
+  }
+
+  // 取某根K线对应的 0AMV 涨跌幅
+  //   日K   -> 当天的日涨跌幅
+  //   周/月/年 -> 该周期内 0AMV 的累计涨跌幅（用日线收盘复利）
+  function oamvChangeFor(dates, idx) {
+    if (!dailyMap || !dates.length) return null;
+    var d = String(dates[idx] || "").replace(/-/g, "");
+    if (idx === 0 || cur.period === "day") {
+      var e = dailyMap[d];
+      return e ? e.chg : null;
+    }
+    // 粗粒度：从上一根K线的次日 到 本根K线当天，0AMV 收盘的累计变化
+    var prev = String(dates[idx - 1] || "").replace(/-/g, "");
+    var from = dailyMap[prev];
+    var to = dailyMap[d];
+    if (!from || !to || !from.close || !to.close) return null;
+    return (to.close / from.close - 1) * 100;
+  }
 
   // 把区间起止日映射到 K 线的**类别索引**。
   //
@@ -325,7 +390,32 @@
         backgroundColor: "rgba(18, 23, 34, .96)",
         borderColor: "rgba(255,255,255,.1)",
         textStyle: { color: "#e8ecf3", fontSize: 12 },
-        extraCssText: "max-width:380px;white-space:normal;box-shadow:0 8px 24px rgba(0,0,0,.45);border-radius:8px;"
+        extraCssText: "max-width:380px;white-space:normal;box-shadow:0 8px 24px rgba(0,0,0,.45);border-radius:8px;",
+        formatter: function (params) {
+          if (!params || !params.length) return "";
+          var p = params[0];
+          var dateStr = p.axisValue || "";
+          var k = p.data;               // candlestick: [open, close, low, high]
+          if (!k || !k.length) return "";
+          var idx = p.dataIndex;
+          var chg = oamvChangeFor(dates, idx);
+          var band = (bandMap && bandMap[String(dateStr).replace(/-/g, "")]) || "";
+          // 区间色: 空头=绿, 多头=红 —— 与图上背景色一致
+          var bandColor = band === "空头波段" ? COLOR_DOWN
+                        : (band === "多头区间" ? COLOR_UP : COLOR_MUTED);
+          var bandLabel = band ? ("　" + band) : "";
+          var html = '<div style="font-size:11px;color:#8b94a7;margin-bottom:4px">' +
+                     dateStr + bandLabel + "</div>";
+          html += '<div style="line-height:1.75">开 ' + fmtNum(k[0]) +
+                  "　高 " + fmtNum(k[3]) + "<br/>" +
+                  "收 " + fmtNum(k[1]) + "　低 " + fmtNum(k[2]) + "</div>";
+          if (chg !== null && chg !== undefined) {
+            html += '<div style="margin-top:5px;padding-top:5px;' +
+                    'border-top:1px solid rgba(255,255,255,.12);color:' + bandColor +
+                    ';font-weight:600">0AMV 涨跌 ' + fmtPct(chg) + "</div>";
+          }
+          return html;
+        }
       },
       legend: { data: [name], top: 0, textStyle: { color: "#c6cdd9", fontSize: 11 } },
       grid: [
@@ -467,6 +557,7 @@
         state = d.state || null;
         latest = d.latest || null;
         stateDays = (d.state_days === null || d.state_days === undefined) ? null : d.state_days;
+        buildLookups(d.daily || [], bands);
         load();
       })
       .catch(function () { load(); });
