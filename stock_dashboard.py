@@ -211,6 +211,28 @@ API_TOKEN = os.environ.get("DASHBOARD_TOKEN", "").strip()
 # 看板数据（2026-11-22 巡检 P2-25）。确有跨域需求时显式指定来源。
 CORS_ORIGIN = os.environ.get("DASHBOARD_CORS_ORIGIN", "").strip()
 
+# ============================================================
+# 大盘概览（综合选股页）
+# ============================================================
+# 指数K线：上证指数 / 创业板指。数据源是通达信本地已下载数据。
+INDEX_CODES = {
+    "000001.SH": "上证指数",
+    "399006.SZ": "创业板指",
+}
+INDEX_PERIODS = ("day", "week", "month", "year")
+# period -> (通达信 period, 取多少根)
+#   year 没有原生周期，用日K聚合(2500 根日K ≈ 10 年)
+_INDEX_PERIOD_SPEC = {
+    "day": ("1d", 1500),
+    "week": ("1w", 520),
+    "month": ("1mon", 300),
+    "year": ("1d", 2500),
+}
+# 0AMV 多/空头区间（由 compass_0amv/daily_0amv.py 每日写出）
+OAMV_BANDS_FILE = os.environ.get(
+    "OAMV_BANDS_FILE",
+    r"C:\Users\openclaw\Desktop\win_WorkSpace_ClaudeCode\compass_0amv\logs\0amv_bands.json")
+
 DATA_LOCK = threading.Lock()
 FETCH_LOCK = threading.Lock()
 
@@ -296,6 +318,69 @@ MINUTE_PERIODS = ("1m", "5m", "15m", "30m", "1h", "1d", "1w", "1mon")
 INDICATOR_FORMULAS = ("MA", "KDJ", "MACD", "BOLL", "VOL", "RSI", "WR", "DMA", "ASI")
 _CODE_PATTERN = re.compile(r"^[0-9A-Za-z]{4,10}\.(SH|SZ|BJ)$")
 _FORMULA_ARG_PATTERN = re.compile(r"^[0-9,.\-]{0,40}$")
+
+
+def _normalize_bars(raw):
+    """通达信 K 线 dict -> [{date, open, high, low, close, volume}]"""
+    ts = raw.get("timestamps") or []
+    o = raw.get("Open") or []
+    h = raw.get("High") or []
+    l = raw.get("Low") or []
+    c = raw.get("Close") or []
+    v = raw.get("Volume") or []
+    out = []
+    for i, t in enumerate(ts):
+        d = str(t)[:10]
+        out.append({
+            "date": d,
+            "open": _fnum(o[i] if i < len(o) else None),
+            "high": _fnum(h[i] if i < len(h) else None),
+            "low": _fnum(l[i] if i < len(l) else None),
+            "close": _fnum(c[i] if i < len(c) else None),
+            "volume": _fnum(v[i] if i < len(v) else None),
+        })
+    return out
+
+
+def _fnum(x):
+    try:
+        f = float(x)
+    except (TypeError, ValueError):
+        return None
+    if f != f:
+        return None
+    return round(f, 4)
+
+
+def _aggregate_by_year(bars):
+    """日K -> 年K（开=首日开/高=期间最高/低=期间最低/收=末日收/量=合计）"""
+    groups = {}
+    order = []
+    for b in bars:
+        y = (b.get("date") or "")[:4]
+        if not y:
+            continue
+        if y not in groups:
+            groups[y] = []
+            order.append(y)
+        groups[y].append(b)
+    out = []
+    for y in order:
+        g = groups[y]
+        highs = [x["high"] for x in g if x["high"] is not None]
+        lows = [x["low"] for x in g if x["low"] is not None]
+        vols = [x["volume"] for x in g if x["volume"] is not None]
+        out.append({
+            # 用**实际最后一个交易日**做日期，不是 "%s-12-31" ——
+            # 那会造出未来日期(2026-12-31)，前端区间对齐会找不到对应 K 线
+            "date": g[-1]["date"],
+            "open": g[0]["open"],
+            "high": max(highs) if highs else None,
+            "low": min(lows) if lows else None,
+            "close": g[-1]["close"],
+            "volume": round(sum(vols), 4) if vols else None,
+        })
+    return out
 
 
 def in_trading_hours(now=None):
@@ -1388,6 +1473,10 @@ class Handler(BaseHTTPRequestHandler):
             self._serve_alerts()
         elif route.startswith("/api/minute"):
             self._serve_minute()
+        elif route.startswith("/api/index/kline"):
+            self._serve_index_kline()
+        elif route.startswith("/api/oamv/bands"):
+            self._serve_oamv_bands()
         elif route.startswith("/api/indicator"):
             self._serve_indicator()
         elif route.startswith("/api/data/period_compare"):
@@ -1485,6 +1574,78 @@ class Handler(BaseHTTPRequestHandler):
             "count": len(data.get("timestamps", [])),
             "data": data,
         })
+
+    def _serve_index_kline(self):
+        """GET /api/index/kline?code=000001.SH&period=day|week|month|year
+
+        大盘概览用的指数K线。数据源：通达信本地已下载数据(tq.get_market_data)。
+        year 没有原生周期 —— 取日K按自然年聚合(开=首日开/高=期间最高/低=期间最低/收=末日收)。
+        """
+        from urllib.parse import urlparse, parse_qs
+        qs = parse_qs(urlparse(self.path).query)
+        code = (qs.get("code", [""])[0] or "").strip().upper()
+        period = (qs.get("period", ["day"])[0] or "day").strip().lower()
+        if code not in INDEX_CODES:
+            self._send_json_response(400, {"ok": False, "code": 400, "error": "invalid_code",
+                                           "message": "code 仅支持 %s"
+                                                      % " / ".join(INDEX_CODES)})
+            return
+        if period not in INDEX_PERIODS:
+            self._send_json_response(400, {"ok": False, "code": 400, "error": "invalid_period",
+                                           "message": "period 仅支持 %s" % list(INDEX_PERIODS)})
+            return
+        if not TDX_OK:
+            self._send_json_response(503, {"ok": False, "code": 503, "error": "tdx_unavailable",
+                                           "message": "tdx_client 不可用"})
+            return
+        tdx_period, count = _INDEX_PERIOD_SPEC[period]
+        try:
+            bars = tdx_client.get_minute_bars([code], period=tdx_period, count=count)
+        except Exception as e:
+            logger.warning("指数K线获取异常: %s", e)
+            self._send_json_response(503, {"ok": False, "code": 503, "error": "tdx_error",
+                                           "message": "指数K线获取失败"})
+            return
+        if bars is None:
+            self._send_json_response(503, {"ok": False, "code": 503, "error": "tdx_unavailable",
+                                           "message": "通达信 TQ 调用失败或超时"})
+            return
+        raw = bars.get(code) or {}
+        out = _normalize_bars(raw)
+        if period == "year":
+            out = _aggregate_by_year(out)
+        self._send_json_response(200, {
+            "ok": True,
+            "code": code,
+            "name": INDEX_CODES[code],
+            "period": period,
+            "count": len(out),
+            "bars": out,
+        })
+
+    def _serve_oamv_bands(self):
+        """GET /api/oamv/bands — 0AMV 多/空头区间(给大盘概览标背景色用)
+
+        数据来自 compass_0amv 的每日任务(compass_0amv/daily_0amv.py)写出的
+        0amv_bands.json。文件还没生成时返回空数组，不报错。
+        """
+        try:
+            with open(OAMV_BANDS_FILE, encoding="utf-8") as f:
+                payload = json.load(f)
+        except FileNotFoundError:
+            self._send_json_response(200, {"ok": True, "bands": [], "signals": [],
+                                           "state": None, "source": None,
+                                           "message": "尚未生成（每日任务 compass_0amv/daily_0amv.py 会写）"})
+            return
+        except Exception as e:
+            logger.warning("读取 0AMV 区间文件失败: %s", e)
+            self._send_json_response(200, {"ok": True, "bands": [], "signals": [],
+                                           "state": None, "source": None,
+                                           "message": "区间文件读取失败"})
+            return
+        payload.setdefault("ok", True)
+        payload["source"] = OAMV_BANDS_FILE
+        self._send_json_response(200, payload)
 
     def _serve_indicator(self):
         """GET /api/indicator?code=600519.SH&formula=KDJ&arg=9,3,3&period=1d&count=120 — 内置公式指标。

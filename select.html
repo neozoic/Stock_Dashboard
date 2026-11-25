@@ -5,12 +5,54 @@
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <title>综合选股</title>
 <link rel="stylesheet" href="common.css">
+<script src="echarts.min.js"></script>
 <style>
   .wrap { padding: 22px 18px 40px; max-width: 1400px; margin: 0 auto; }
   .sec-title {
     font-size: 11px; color: var(--muted); letter-spacing: .16em;
-    text-transform: uppercase; margin: 10px 0 12px;
+    text-transform: uppercase; margin: 18px 0 12px;
   }
+  .card {
+    background: var(--card);
+    border: 1px solid var(--border);
+    border-radius: var(--radius);
+    padding: 14px 16px;
+    box-shadow: inset 0 1px 0 rgba(255, 255, 255, .03), 0 6px 18px rgba(0, 0, 0, .22);
+  }
+  .card h2 {
+    font-size: 13px; font-weight: 600; letter-spacing: .05em;
+    color: var(--text);
+    display: flex; justify-content: space-between; align-items: baseline; gap: 10px;
+    padding-left: 10px; position: relative;
+    margin: 0 0 8px;
+  }
+  .card h2::before {
+    content: ""; position: absolute; left: 0; top: 2px; bottom: 2px;
+    width: 3px; border-radius: 2px; background: var(--accent);
+  }
+  .card h2 .meta {
+    font-size: 10px; color: var(--muted); font-weight: normal;
+    letter-spacing: 0; text-align: right;
+  }
+  .hint {
+    font-size: 10.5px; color: var(--muted); font-weight: normal;
+    letter-spacing: 0; margin: 0 0 8px 10px; line-height: 1.6;
+  }
+  .hint b { color: var(--text); font-weight: 600; }
+  .hint .tag-long { color: var(--up-soft); font-weight: 600; }
+  .hint .tag-short { color: var(--down-soft); font-weight: 600; }
+  .ov-controls {
+    display: flex; gap: 10px; align-items: center; margin: 0 0 10px 10px; flex-wrap: wrap;
+  }
+  .ov-controls select {
+    background: var(--card-hover); color: var(--text);
+    border: 1px solid var(--border); border-radius: 8px;
+    padding: 5px 10px; font-size: 12px; font-family: inherit;
+    cursor: pointer; outline: none;
+  }
+  .ov-controls select:hover { border-color: var(--border-hover); }
+  .ov-note { font-size: 11px; color: var(--muted); }
+  .chart-box { width: 100%; height: 460px; }
   .placeholder {
     border: 1px dashed var(--border-hover); border-radius: var(--radius);
     padding: 44px 24px; text-align: center; color: var(--muted);
@@ -18,6 +60,14 @@
     background: rgba(255, 255, 255, .012);
   }
   .placeholder b { color: var(--text); font-weight: 600; }
+  .topnav { display: inline-flex; gap: 12px; align-items: center; }
+  .topnav-link {
+    font-size: 11.5px; color: var(--muted); text-decoration: none;
+    padding: 5px 11px; border-radius: 999px;
+    border: 1px solid var(--border); background: rgba(255, 255, 255, .03);
+    transition: color .16s ease, border-color .16s ease;
+  }
+  .topnav-link:hover { color: var(--text); border-color: var(--border-hover); }
 </style>
 </head>
 <body>
@@ -50,6 +100,30 @@
 </header>
 
 <main class="wrap">
+  <div class="sec-title">大盘概览</div>
+  <div class="card">
+    <h2>指数 K 线 <span class="meta" id="ov-meta">加载中…</span></h2>
+    <p class="hint">
+      K 线背景色标示 0AMV「活跃市值」的多/空头区间：
+      <span class="tag-long">淡红 = 多头区间</span>（当日涨幅 ≥ +4% 或连续 2 日加和 ≥ +4%）·
+      <span class="tag-short">淡绿 = 空头波段</span>（当日跌幅 ≤ -2.3%）
+    </p>
+    <div class="ov-controls">
+      <select id="ov-index">
+        <option value="000001.SH">上证指数</option>
+        <option value="399006.SZ">创业板指</option>
+      </select>
+      <select id="ov-period">
+        <option value="day" selected>日 K</option>
+        <option value="week">周 K</option>
+        <option value="month">月 K</option>
+        <option value="year">年 K</option>
+      </select>
+      <span class="ov-note" id="ov-note"></span>
+    </div>
+    <div id="ov-chart" class="chart-box"></div>
+  </div>
+
   <div class="sec-title">综合选股</div>
   <div class="placeholder">
     <b>布局稍后设计</b><br>
@@ -58,5 +132,207 @@
 </main>
 
 <script src="clock.js"></script>
+<script>
+(function () {
+  "use strict";
+
+  // 空头=淡绿 / 多头=淡红（A股习惯：绿跌红涨）
+  // 透明度要很低 —— 区间可能连续覆盖几百根K线，颜色一深整张图就糊了
+  var COLOR_SHORT = "rgba(46, 189, 133, .075)";   // --down
+  var COLOR_LONG = "rgba(246, 70, 93, .075)";     // --up
+  var COLOR_UP = "#f6465d";
+  var COLOR_DOWN = "#2ebd85";
+  var COLOR_MUTED = "#8b94a7";
+  var COLOR_AXIS = "rgba(255,255,255,.08)";
+
+  var chart = null;
+  var bands = [];       // 0AMV 多/空头区间
+  var state = null;     // 当前区间状态
+  var cur = { code: "000001.SH", period: "day" };
+
+  function fmtDate(yyyymmdd) {
+    var s = String(yyyymmdd || "");
+    if (s.length !== 8) return "";
+    return s.slice(0, 4) + "-" + s.slice(4, 6) + "-" + s.slice(6, 8);
+  }
+
+  // 把区间起止日映射到 K 线的**类别索引**。
+  //
+  // 为什么不用 xAxis: "2026-11-06" 这种类别值定位 markArea：
+  //   0AMV 数据与指数 K 线的日期常常对不上（651 段里有 586 段起止日不在 K 线类别值上），
+  //   类别值匹配不上时 ECharts 会画到错误位置，整张图糊成一片。
+  //   改用「类别索引」定位（xAxisIndex 数值），配合 xAxis type=category，
+  //   区间块一定落在两根真实 K 线之间。
+  // 每根 bar 的"周期起点回溯天数" —— 判断区间是否与该 bar 重叠时用。
+  //   周K 的 bar 日期是该周**最后**交易日，月K/年K 同理；
+  //   所以短区间（如只到周三）在周K 上直接用 bar 日期比较会整个丢掉，
+  //   必须按"周期有重叠就算"来判定。
+  function periodOffset(period) {
+    if (period === "week") return 7;
+    if (period === "month") return 32;
+    if (period === "year") return 370;
+    return 1;   // 日K
+  }
+
+  function buildMarkArea(dates, period) {
+    if (!dates.length) return [];
+    var off = periodOffset(period);
+    var first = dates[0].replace(/-/g, "");
+    var last = dates[dates.length - 1].replace(/-/g, "");
+    var areas = [];
+    for (var i = 0; i < bands.length; i++) {
+      var b = bands[i];
+      var st = fmtDate(b.start).replace(/-/g, "");
+      var en = fmtDate(b.end).replace(/-/g, "");
+      if (!st || !en) continue;
+      // 整个区间都在 K 线范围之外 -> 跳过
+      //   早于范围：K线2020起，区间可能回溯到1993 —— 不跳过的话会被压成 [0,0]，
+      //            650 个区间全堆在图的最左边，整张图糊掉（2026-11-25 踩过）
+      if (en < first) continue;
+      if (st > last) continue;
+
+      var si = -1, ei = -1;
+      for (var j = 0; j < dates.length; j++) {
+        var dj = dates[j].replace(/-/g, "");
+        // bar 的周期结束日 >= 区间开始 -> 该 bar 覆盖区间开头
+        if (si < 0 && dj >= st) si = j;
+        // bar 的周期起始日 <= 区间结束 -> 该 bar 与区间有重叠
+        if (dj - off <= en) ei = j;
+      }
+      if (si < 0) continue;
+      if (ei < si) ei = si;                  // 区间末尾超出K线 -> 至少留一根
+      areas.push([
+        {
+          xAxis: si,
+          itemStyle: { color: b.type === "空头波段" ? COLOR_SHORT : COLOR_LONG }
+        },
+        { xAxis: ei }
+      ]);
+    }
+    return areas;
+  }
+
+  function render(bars, name, period) {
+    var dates = bars.map(function (b) { return b.date; });
+    var kdata = bars.map(function (b) { return [b.open, b.close, b.low, b.high]; });
+    var vdata = bars.map(function (b) { return b.volume; });
+    var areas = buildMarkArea(dates, period || cur.period);
+
+    var opt = {
+      animation: false,
+      backgroundColor: "transparent",
+      textStyle: { color: "#e8ecf3", fontSize: 12 },
+      tooltip: {
+        trigger: "axis",
+        axisPointer: { type: "cross" },
+        confine: true,
+        backgroundColor: "rgba(18, 23, 34, .96)",
+        borderColor: "rgba(255,255,255,.1)",
+        textStyle: { color: "#e8ecf3", fontSize: 12 },
+        extraCssText: "max-width:380px;white-space:normal;box-shadow:0 8px 24px rgba(0,0,0,.45);border-radius:8px;"
+      },
+      legend: { data: [name], top: 0, textStyle: { color: "#c6cdd9", fontSize: 11 } },
+      grid: [
+        { left: 58, right: 24, top: 26, height: "58%" },
+        { left: 58, right: 24, top: "74%", height: "16%" }
+      ],
+      xAxis: [
+        { type: "category", data: dates, gridIndex: 0, boundaryGap: true,
+          axisLabel: { show: false }, axisLine: { lineStyle: { color: COLOR_AXIS } },
+          axisTick: { show: false }, splitLine: { show: false } },
+        { type: "category", data: dates, gridIndex: 1, boundaryGap: true,
+          axisLabel: { color: COLOR_MUTED, fontSize: 10 },
+          axisLine: { lineStyle: { color: COLOR_AXIS } },
+          axisTick: { show: false }, splitLine: { show: false } }
+      ],
+      yAxis: [
+        { scale: true, gridIndex: 0, name: "点位",
+          nameTextStyle: { color: COLOR_MUTED, fontSize: 10 },
+          axisLabel: { color: COLOR_MUTED, fontSize: 10 },
+          splitLine: { lineStyle: { color: COLOR_AXIS } } },
+        { scale: true, gridIndex: 1, name: "量",
+          nameTextStyle: { color: COLOR_MUTED, fontSize: 10 },
+          axisLabel: { color: COLOR_MUTED, fontSize: 10 },
+          splitLine: { show: false } }
+      ],
+      dataZoom: [
+        { type: "inside", xAxisIndex: [0, 1], start: 60, end: 100 },
+        { type: "slider", xAxisIndex: [0, 1], bottom: 4, height: 16,
+          borderColor: COLOR_AXIS, backgroundColor: "transparent",
+          textStyle: { color: COLOR_MUTED, fontSize: 10 } }
+      ],
+      series: [
+        {
+          name: name, type: "candlestick", data: kdata,
+          itemStyle: { color: COLOR_UP, color0: COLOR_DOWN, borderColor: COLOR_UP, borderColor0: COLOR_DOWN },
+          markArea: { silent: true, data: areas }
+        },
+        {
+          name: "成交量", type: "bar", xAxisIndex: 1, yAxisIndex: 1, data: vdata,
+          itemStyle: { color: "rgba(79,156,249,.45)" }
+        }
+      ]
+    };
+    chart.setOption(opt, true);
+  }
+
+  function updateMeta(name, n) {
+    var el = document.getElementById("ov-meta");
+    var txt = name + " · " + n + " 根K线";
+    if (state && state.type) {
+      txt += " · 当前区间【" + state.type + "】" +
+             (state.start ? " 起于 " + fmtDate(state.start) : "");
+      if (state.cum_pct != null && state.cum_pct !== undefined) {
+        txt += "（区间 " + (state.cum_pct >= 0 ? "+" : "") + state.cum_pct.toFixed(2) + "%）";
+      }
+    }
+    el.textContent = txt;
+    var note = document.getElementById("ov-note");
+    note.textContent = bands.length ? ("已标注 " + bands.length + " 段多/空区间") : "暂无区间标注";
+  }
+
+  function load() {
+    var url = "/api/index/kline?code=" + encodeURIComponent(cur.code) +
+              "&period=" + encodeURIComponent(cur.period);
+    document.getElementById("ov-meta").textContent = "加载中…";
+    fetch(url, { cache: "no-store" })
+      .then(function (r) { return r.json(); })
+      .then(function (d) {
+        if (!d.ok) {
+          document.getElementById("ov-meta").textContent = "加载失败：" + (d.message || d.error);
+          return;
+        }
+        render(d.bars || [], d.name || cur.code, d.period || cur.period);
+        updateMeta(d.name || cur.code, d.count || 0);
+      })
+      .catch(function () {
+        document.getElementById("ov-meta").textContent = "加载失败";
+      });
+  }
+
+  function loadBands() {
+    return fetch("/api/oamv/bands", { cache: "no-store" })
+      .then(function (r) { return r.json(); })
+      .then(function (d) {
+        bands = d.bands || [];
+        state = d.state || null;
+        load();
+      })
+      .catch(function () { load(); });
+  }
+
+  document.addEventListener("DOMContentLoaded", function () {
+    chart = echarts.init(document.getElementById("ov-chart"));
+    document.getElementById("ov-index").addEventListener("change", function () {
+      cur.code = this.value; load();
+    });
+    document.getElementById("ov-period").addEventListener("change", function () {
+      cur.period = this.value; load();
+    });
+    window.addEventListener("resize", function () { chart.resize({ silent: true }); });
+    loadBands();
+  });
+})();
+</script>
 </body>
 </html>
