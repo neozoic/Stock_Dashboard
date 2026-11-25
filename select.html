@@ -22,7 +22,7 @@
   .card h2 {
     font-size: 13px; font-weight: 600; letter-spacing: .05em;
     color: var(--text);
-    display: flex; justify-content: space-between; align-items: baseline; gap: 10px;
+    display: flex; justify-content: space-between; align-items: center; gap: 10px;
     padding-left: 10px; position: relative;
     margin: 0 0 8px;
   }
@@ -34,6 +34,59 @@
     font-size: 10px; color: var(--muted); font-weight: normal;
     letter-spacing: 0; text-align: right;
   }
+  /* ============ 当前多/空区间徽章(醒目) ============ */
+  .band-badge {
+    display: inline-flex; align-items: center; gap: 7px;
+    margin-left: auto; margin-right: 10px;
+    padding: 5px 14px; border-radius: 999px;
+    font-size: 12.5px; font-weight: 700; letter-spacing: .04em;
+    white-space: nowrap;
+    border: 1px solid transparent;
+    transition: background .2s ease, color .2s ease;
+  }
+  .band-badge .bdot {
+    width: 8px; height: 8px; border-radius: 50%;
+    background: currentColor; flex: none;
+  }
+  .band-badge .bsub {
+    font-weight: 500; font-size: 11px; opacity: .9; letter-spacing: 0;
+  }
+  .band-badge.is-long {
+    color: var(--up-soft);
+    background: var(--up-bg);
+    border-color: rgba(246, 70, 93, .38);
+  }
+  .band-badge.is-short {
+    color: var(--down-soft);
+    background: var(--down-bg);
+    border-color: rgba(46, 189, 133, .38);
+  }
+  .band-badge.is-unknown {
+    color: var(--muted); background: rgba(255, 255, 255, .04);
+    border-color: var(--border);
+  }
+  .band-badge.is-long .bdot { animation: badgeBreath 2.4s ease-in-out infinite; }
+  @keyframes badgeBreath {
+    0%, 100% { box-shadow: 0 0 0 0 rgba(246, 70, 93, .5); }
+    50% { box-shadow: 0 0 0 5px rgba(246, 70, 93, 0); }
+  }
+  /* ============ 明细条 ============ */
+  .ov-stats {
+    display: flex; gap: 26px; flex-wrap: wrap;
+    margin: 0 0 12px 10px;
+    padding: 9px 14px; border-radius: 9px;
+    background: rgba(255, 255, 255, .022);
+    border: 1px solid var(--border);
+  }
+  .ov-stat { display: flex; flex-direction: column; gap: 3px; min-width: 62px; }
+  .ov-stat .k { font-size: 10px; color: var(--muted); letter-spacing: .04em; }
+  .ov-stat .v {
+    font-size: 13px; color: var(--text); font-weight: 600;
+    font-variant-numeric: tabular-nums; white-space: nowrap;
+  }
+  .ov-stat .v.up { color: var(--up-soft); }
+  .ov-stat .v.down { color: var(--down-soft); }
+  .ov-stat .v.mute { color: var(--muted); font-weight: 400; }
   .hint {
     font-size: 10.5px; color: var(--muted); font-weight: normal;
     letter-spacing: 0; margin: 0 0 8px 10px; line-height: 1.6;
@@ -102,7 +155,12 @@
 <main class="wrap">
   <div class="sec-title">大盘概览</div>
   <div class="card">
-    <h2>指数 K 线 <span class="meta" id="ov-meta">加载中…</span></h2>
+    <h2>指数 K 线
+      <span class="band-badge is-unknown" id="ov-band-badge">
+        <span class="bdot"></span><span class="blabel">区间未知</span><span class="bsub"></span>
+      </span>
+      <span class="meta" id="ov-meta">加载中…</span>
+    </h2>
     <p class="hint">
       K 线背景色标示 0AMV「活跃市值」的多/空头区间：
       <span class="tag-long">淡红 = 多头区间</span>（当日涨幅 ≥ +4% 或连续 2 日加和 ≥ +4%）·
@@ -121,6 +179,7 @@
       </select>
       <span class="ov-note" id="ov-note"></span>
     </div>
+    <div class="ov-stats" id="ov-stats"></div>
     <div id="ov-chart" class="chart-box"></div>
   </div>
 
@@ -140,6 +199,9 @@
   // 透明度要很低 —— 区间可能连续覆盖几百根K线，颜色一深整张图就糊了
   var COLOR_SHORT = "rgba(46, 189, 133, .075)";   // --down
   var COLOR_LONG = "rgba(246, 70, 93, .075)";     // --up
+  // 当前区间用更深的色 + 边框，一眼定位
+  var COLOR_SHORT_STRONG = "rgba(46, 189, 133, .20)";
+  var COLOR_LONG_STRONG = "rgba(246, 70, 93, .20)";
   var COLOR_UP = "#f6465d";
   var COLOR_DOWN = "#2ebd85";
   var COLOR_MUTED = "#8b94a7";
@@ -148,6 +210,8 @@
   var chart = null;
   var bands = [];       // 0AMV 多/空头区间
   var state = null;     // 当前区间状态
+  var latest = null;    // 最新一天的 活跃/死筹/活跃占比
+  var stateDays = null; // 当前区间已持续几个交易日
   var cur = { code: "000001.SH", period: "day" };
 
   function fmtDate(yyyymmdd) {
@@ -155,6 +219,13 @@
     if (s.length !== 8) return "";
     return s.slice(0, 4) + "-" + s.slice(4, 6) + "-" + s.slice(6, 8);
   }
+
+  function fmtPct(x, digits) {
+    if (x === null || x === undefined || isNaN(x)) return "--";
+    return (x >= 0 ? "+" : "") + Number(x).toFixed(digits === undefined ? 2 : digits) + "%";
+  }
+
+  function clsFor(x) { return x > 0 ? "up" : (x < 0 ? "down" : "mute"); }
 
   // 把区间起止日映射到 K 线的**类别索引**。
   //
@@ -180,6 +251,8 @@
     var first = dates[0].replace(/-/g, "");
     var last = dates[dates.length - 1].replace(/-/g, "");
     var areas = [];
+    // 当前区间：画得更醒目（色深一点 + 边框），一眼能看出"现在在哪一段"
+    var curBand = currentBand(dates, off, first, last);
     for (var i = 0; i < bands.length; i++) {
       var b = bands[i];
       var st = fmtDate(b.start).replace(/-/g, "");
@@ -201,15 +274,38 @@
       }
       if (si < 0) continue;
       if (ei < si) ei = si;                  // 区间末尾超出K线 -> 至少留一根
+      var isCur = curBand && si === curBand[0] && ei === curBand[1];
+      var base = b.type === "空头波段" ? COLOR_SHORT : COLOR_LONG;
       areas.push([
         {
           xAxis: si,
-          itemStyle: { color: b.type === "空头波段" ? COLOR_SHORT : COLOR_LONG }
+          itemStyle: isCur
+            ? { color: b.type === "空头波段" ? COLOR_SHORT_STRONG : COLOR_LONG_STRONG,
+                borderColor: b.type === "空头波段" ? COLOR_DOWN : COLOR_UP,
+                borderWidth: 1.5 }
+            : { color: base }
         },
         { xAxis: ei }
       ]);
     }
     return areas;
+  }
+
+  // 找出"当前"所处的区间在 K 线上的索引范围
+  function currentBand(dates, off, first, last) {
+    if (!state || !state.type || !dates.length) return null;
+    var st = fmtDate(state.start).replace(/-/g, "");
+    var en = fmtDate(state.end || state.start).replace(/-/g, "");
+    if (!st) return null;
+    var si = -1, ei = -1;
+    for (var j = 0; j < dates.length; j++) {
+      var dj = dates[j].replace(/-/g, "");
+      if (si < 0 && dj >= st) si = j;
+      if (dj - off <= en) ei = j;
+    }
+    if (si < 0) return null;
+    if (ei < si) ei = si;
+    return [si, ei];
   }
 
   function render(bars, name, period) {
@@ -277,18 +373,71 @@
   }
 
   function updateMeta(name, n) {
-    var el = document.getElementById("ov-meta");
-    var txt = name + " · " + n + " 根K线";
-    if (state && state.type) {
-      txt += " · 当前区间【" + state.type + "】" +
-             (state.start ? " 起于 " + fmtDate(state.start) : "");
-      if (state.cum_pct != null && state.cum_pct !== undefined) {
-        txt += "（区间 " + (state.cum_pct >= 0 ? "+" : "") + state.cum_pct.toFixed(2) + "%）";
-      }
-    }
-    el.textContent = txt;
+    document.getElementById("ov-meta").textContent = name + " · " + n + " 根K线";
     var note = document.getElementById("ov-note");
     note.textContent = bands.length ? ("已标注 " + bands.length + " 段多/空区间") : "暂无区间标注";
+    renderBadge();
+    renderStats();
+  }
+
+  // ============ 当前区间徽章（醒目） ============
+  function renderBadge() {
+    var badge = document.getElementById("ov-band-badge");
+    var label = badge.querySelector(".blabel");
+    var sub = badge.querySelector(".bsub");
+    if (!state || !state.type) {
+      badge.className = "band-badge is-unknown";
+      label.textContent = "区间未知";
+      if (sub) sub.textContent = "";
+      return;
+    }
+    var isLong = state.type === "多头区间";
+    badge.className = "band-badge " + (isLong ? "is-long" : "is-short");
+    label.textContent = state.type;
+    if (sub) {
+      var bits = [];
+      if (stateDays) bits.push("已 " + stateDays + " 个交易日");
+      // 区间刚开启（只有 1 天）时 cum_pct 恒为 0，没信息量 —— 改显示当日涨跌
+      if (stateDays && stateDays > 1 && state.cum_pct !== null && state.cum_pct !== undefined) {
+        bits.push("区间 " + fmtPct(state.cum_pct));
+      } else if (latest && latest.chg !== null && latest.chg !== undefined) {
+        bits.push("当日 " + fmtPct(latest.chg));
+      }
+      sub.textContent = bits.join(" · ");
+    }
+  }
+
+  // ============ 明细条（决策要看的数） ============
+  function renderStats() {
+    var box = document.getElementById("ov-stats");
+    if (!box) return;
+    var items = [];
+    function add(k, v, c) { items.push('<div class="ov-stat"><span class="k">' + k +
+                                      '</span><span class="v ' + (c || "") + '">' + v + "</span></div>"); }
+
+    if (state && state.type) {
+      add("当前区间", state.type, state.type === "多头区间" ? "up" : "down");
+      add("起始日", fmtDate(state.start) || "--", "mute");
+      if (stateDays) add("持续", stateDays + " 个交易日", "mute");
+      // 区间只有 1 天时 cum_pct 恒为 0，显示当日涨跌更有意义
+      if (stateDays && stateDays > 1 && state.cum_pct !== null && state.cum_pct !== undefined) {
+        add("区间涨跌", fmtPct(state.cum_pct), clsFor(state.cum_pct));
+      }
+    } else {
+      add("当前区间", "未知", "mute");
+    }
+    if (latest) {
+      add("0AMV 活跃市值", (latest.close === null || latest.close === undefined)
+          ? "--" : Number(latest.close).toFixed(1) + " 亿", "mute");
+      if (latest.chg !== null && latest.chg !== undefined) {
+        add("当日涨跌", fmtPct(latest.chg), clsFor(latest.chg));
+      }
+      if (latest.active_ratio !== null && latest.active_ratio !== undefined) {
+        add("活跃占比", (latest.active_ratio * 100).toFixed(2) + "%", "mute");
+      }
+      add("数据截至", fmtDate(latest.date) || "--", "mute");
+    }
+    box.innerHTML = items.join("");
   }
 
   function load() {
@@ -316,6 +465,8 @@
       .then(function (d) {
         bands = d.bands || [];
         state = d.state || null;
+        latest = d.latest || null;
+        stateDays = (d.state_days === null || d.state_days === undefined) ? null : d.state_days;
         load();
       })
       .catch(function () { load(); });
