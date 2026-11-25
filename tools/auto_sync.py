@@ -206,13 +206,14 @@ def main_loop():
             fc, ld, has = get_pending_changes()
             if has:
                 if (fc, ld) != last_summary:
+                    # 变动内容变了 -> 重新计时
                     log(f"检测到变动: {fc} 文件, {ld} 行 (待 debounce)")
                     last_summary = (fc, ld)
-                last_change_time = time.time()
-                idle_ticks = 0
-            else:
-                # 无变动
-                if last_change_time and (time.time() - last_change_time) > DEBOUNCE_SECONDS:
+                    last_change_time = time.time()
+                elif last_change_time and (time.time() - last_change_time) > DEBOUNCE_SECONDS:
+                    # 内容已稳定 DEBOUNCE 秒 -> 提交并推送
+                    # 注意提交时改动**还在**（这才是 debounce 的正确语义）；
+                    # 之前把提交放在 else 分支(要求没有未提交改动)导致永远提交不了
                     if is_significant(*last_summary):
                         log(f"debounce 已过({DEBOUNCE_SECONDS}s),提交 {last_summary[0]} 文件 / {last_summary[1]} 行")
                         commit_and_push()
@@ -220,11 +221,15 @@ def main_loop():
                         log(f"变动未达阈值,跳过: {last_summary}")
                     last_change_time = None
                     last_summary = (0, 0)
-                else:
-                    # 空闲时顺手补推"已提交未推送"的 commit (约每 5 分钟一次)
-                    idle_ticks += 1
-                    if idle_ticks % 10 == 0:
-                        push_unpushed()
+                idle_ticks = 0
+            else:
+                # 没有未提交改动 -> 顺手补推"已提交未推送"的 commit (约每 5 分钟一次)
+                idle_ticks += 1
+                if idle_ticks % 10 == 0:
+                    push_unpushed()
+                if last_change_time:
+                    last_change_time = None
+                    last_summary = (0, 0)
             time.sleep(CHECK_INTERVAL)
     except KeyboardInterrupt:
         log("用户中断,退出")
