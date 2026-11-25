@@ -230,6 +230,25 @@ _INDEX_PERIOD_SPEC = {
     "month": ("1mon", 300),
     "year": ("1d", 2500),
 }
+# 指南针 0AMV 工具集（独立仓库，不公开）—— 用于读盘中分时(fde/cde)
+# 路径可用环境变量 COMPASS_0AMV_DIR 覆盖；找不到时 /api/oamv/intraday 返回空
+COMPASS_0AMV_DIR = os.environ.get(
+    "COMPASS_0AMV_DIR",
+    r"C:\Users\openclaw\Desktop\win_WorkSpace_ClaudeCode\compass_0amv")
+
+
+def _load_compass_dds():
+    """导入 compass_0amv 的读取器（失败返回 None）"""
+    try:
+        if COMPASS_0AMV_DIR not in sys.path:
+            sys.path.insert(0, COMPASS_0AMV_DIR)
+        import compass_dds
+        return compass_dds
+    except Exception as e:
+        logger.warning("无法加载 compass_dds (%s): %s", COMPASS_0AMV_DIR, e)
+        return None
+
+
 # 0AMV 多/空头区间（由 tools/compass_0amv/daily_0amv.py 每日写出）
 # 用 __file__ 相对定位 —— 写死绝对路径的话，仓库换个位置就断
 # 0AMV 工具集已拆到独立目录(不公开)，这里按环境变量或默认路径找它写出的区间文件。
@@ -1482,6 +1501,8 @@ class Handler(BaseHTTPRequestHandler):
             self._serve_minute()
         elif route.startswith("/api/index/kline"):
             self._serve_index_kline()
+        elif route.startswith("/api/oamv/intraday"):
+            self._serve_oamv_intraday()
         elif route.startswith("/api/oamv/bands"):
             self._serve_oamv_bands()
         elif route.startswith("/api/indicator"):
@@ -1653,6 +1674,74 @@ class Handler(BaseHTTPRequestHandler):
         payload.setdefault("ok", True)
         payload["source"] = OAMV_BANDS_FILE
         self._send_json_response(200, payload)
+
+    def _serve_oamv_intraday(self):
+        """GET /api/oamv/intraday — 活跃市值/死筹指数的盘中分时
+
+        数据源: 指南针 Temp/Z_SK0AMV__.fde (16B/条, 打开指标视图时更新)
+        只含**当天**的分时。工具集不可用或没有缓存时返回空 points(不报错)。
+        """
+        mod = _load_compass_dds()
+        if mod is None:
+            self._send_json_response(200, {
+                "ok": True, "date": None, "points": [], "fields": {},
+                "message": "未找到 compass_0amv 工具集(设置 COMPASS_0AMV_DIR)"})
+            return
+        try:
+            dds = mod.CompassDDS()
+        except Exception as e:
+            logger.warning("CompassDDS 初始化失败: %s", e)
+            self._send_json_response(200, {
+                "ok": True, "date": None, "points": [], "fields": {},
+                "message": "CompassDDS 初始化失败"})
+            return
+
+        out = {"ok": True, "date": None, "points": [], "fields": {}}
+        for code, key in (("Z_SK0AMV", "active"), ("Z_SK0DMV", "dead")):
+            try:
+                fde = dds.intraday_fde(code)
+            except Exception as e:
+                logger.warning("读 fde 失败 %s: %s", code, e)
+                continue
+            if not fde or not fde.get("points"):
+                continue
+            pts = fde["points"]
+            if out["date"] is None:
+                out["date"] = fde["date"]
+            vals = [p["value"] for p in pts]
+            out["fields"][key] = {
+                "code": code,
+                "count": len(pts),
+                "first_time": pts[0]["time"],
+                "last_time": pts[-1]["time"],
+                "open": vals[0],
+                "last": vals[-1],
+                "high": max(vals),
+                "low": min(vals),
+                "change_pct": round((vals[-1] / vals[0] - 1) * 100, 4) if vals[0] else None,
+                "points": [{"t": p["t"], "v": p["value"]} for p in pts],
+            }
+        # 当日收盘（day.vdat）—— fde 末值只到 14:58:59，真实收盘在这里
+        try:
+            recs = dds.series("Z_SK0AMV")
+            if recs and out["date"]:
+                hit = [r for r in recs if r["date"] == out["date"]]
+                if hit:
+                    r = hit[0]
+                    out["close"] = r["close"]
+                    out["prev_close"] = None
+                    idx = [i for i, x in enumerate(recs) if x["date"] == out["date"]]
+                    if idx and idx[0] > 0:
+                        out["prev_close"] = recs[idx[0] - 1]["close"]
+                    out["open"] = r["open"]
+                    out["high"] = r["high"]
+                    out["low"] = r["low"]
+                    if out["prev_close"]:
+                        out["change_pct"] = round(
+                            (r["close"] / out["prev_close"] - 1) * 100, 4)
+        except Exception as e:
+            logger.warning("读日线失败: %s", e)
+        self._send_json_response(200, out)
 
     def _serve_indicator(self):
         """GET /api/indicator?code=600519.SH&formula=KDJ&arg=9,3,3&period=1d&count=120 — 内置公式指标。
