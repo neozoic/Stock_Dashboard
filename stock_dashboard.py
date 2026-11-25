@@ -230,10 +230,11 @@ _INDEX_PERIOD_SPEC = {
 }
 # 0AMV 多/空头区间（由 tools/compass_0amv/daily_0amv.py 每日写出）
 # 用 __file__ 相对定位 —— 写死绝对路径的话，仓库换个位置就断
+# 0AMV 工具集已拆到独立目录(不公开)，这里按环境变量或默认路径找它写出的区间文件。
+# 找不到时 /api/oamv/bands 返回空数组(前端会显示"区间未知")，不影响看板本体。
 OAMV_BANDS_FILE = os.environ.get(
     "OAMV_BANDS_FILE",
-    os.path.join(os.path.dirname(os.path.abspath(__file__)),
-                 "tools", "compass_0amv", "logs", "0amv_bands.json"))
+    r"C:\Users\openclaw\Desktop\win_WorkSpace_ClaudeCode\compass_0amv\logs\0amv_bands.json")
 
 DATA_LOCK = threading.Lock()
 FETCH_LOCK = threading.Lock()
