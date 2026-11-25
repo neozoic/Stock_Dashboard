@@ -55,6 +55,8 @@ warnings.filterwarnings("ignore")
 # ("Device or resource busy")；退化成截断又会因写入方偏移量不回退，
 # 在文件头留下一整段 NUL 空洞(实测 2.9MB 里 2.86MB 是空洞)。
 # 交给 Python 自己管：轮转时先 close 再 rename，Windows 上可行且无空洞。
+__version__ = "0.2.0"
+
 LOG_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "logs")
 LOG_MAX_BYTES = int(os.environ.get("DASHBOARD_LOG_MAX_BYTES", 8 * 1024 * 1024))
 LOG_BACKUP_COUNT = int(os.environ.get("DASHBOARD_LOG_KEEP", 3))
@@ -1470,6 +1472,8 @@ class Handler(BaseHTTPRequestHandler):
             self._serve_history()
         elif route == "/api/trend":
             self._serve_trend()
+        elif route == "/api/version":
+            self._send_json_response(200, {"ok": True, "version": __version__})
         elif route == "/api/health":
             self._serve_health()
         elif route == "/api/alerts":

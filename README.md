@@ -1,5 +1,7 @@
 # A 股资金流实时看板（Stock_Dashboard）
 
+> 版本 **v0.2.0**　|　更新日志见 [CHANGELOG.md](CHANGELOG.md)
+
 [![GitHub](https://img.shields.io/badge/GitHub-neozoic%2FStock__Dashboard-181717?logo=github)](https://github.com/neozoic/Stock_Dashboard)
 [![Gitee](https://img.shields.io/badge/Gitee-neozoic%2Fstock__dashboard-c71d23?logo=gitee)](https://gitee.com/neozoic/stock_-dashboard)
 [![License](https://img.shields.io/badge/license-MIT-blue)](LICENSE)
