@@ -492,7 +492,25 @@ class _Pusher:
             # 限速（飞书群维度 5 QPS 是群内共享的，留足余量给群里其他人）
             if self.cfg.rate_per_sec > 0:
                 if self._stop.wait(1.0 / self.cfg.rate_per_sec):
+                    # 收到停止信号：把队列里剩下的**发完**再退出，
+                    # 不能就这么走 —— 进程一退，排队中的通知就永远丢了
+                    self._drain()
                     break
+
+    def _drain(self):
+        """退出前把队列里剩下的消息发完（忽略 sentinel）"""
+        while True:
+            try:
+                item = self.queue.get_nowait()
+            except Empty:
+                return
+            try:
+                if item is not _SENTINEL:
+                    self._deliver(item)
+            except Exception as e:
+                logger.error("飞书 drain 异常: %s", type(e).__name__)
+            finally:
+                self.queue.task_done()
 
     def _deliver(self, item):
         msg_type, content = item
