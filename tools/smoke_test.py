@@ -7,6 +7,7 @@ Stock_Dashboard 端到端冒烟测试。
 - **绝不能 import stock_dashboard / tdx_client** —— 模块导入有副作用，
   会 init+close 一个通达信 TQ 槽位（mode 0/1/2/3 每种只有一个，
   烧光后 TQ 再也起不来）。本脚本只走 HTTP + 读文件。
+  （`env_loader` / `feishu_push` 不碰通达信，是无副作用模块，可以 import —— 见第 10 组）
 - 不杀进程、不改任何状态，只读。
 - 退出码：0=全过，1=有失败项。
 
@@ -181,6 +182,83 @@ def main() -> int:
             print("       (跳过：未找到 node)")
     except Exception as e:
         check("前端 JS 语法检查", False, str(e))
+
+    # ---------- 10. 飞书推送模块 ----------
+    # 只做**离线**检查：不真的发消息、不起后台线程、不打印任何密钥。
+    # env_loader / feishu_push 是无副作用模块（不碰通达信 TQ），
+    # 可以安全 import —— 与被明令禁止的 stock_dashboard / tdx_client 不同。
+    print("\n[10] 飞书推送模块")
+    if PROJECT_DIR not in sys.path:
+        sys.path.insert(0, PROJECT_DIR)
+    import threading
+
+    try:
+        import env_loader
+        loaded = env_loader.load_env()
+        # 只报**键的数量**，绝不报值 —— 值里可能有 app_secret
+        check(".env 可加载（只读键名，不打印值）", len(loaded) >= 1,
+              f"加载 {len(loaded)} 项")
+    except Exception as e:
+        check(".env 可加载", False, str(e)[:120])
+
+    before = threading.active_count()
+    try:
+        import feishu_push
+        check("feishu_push 可导入", True)
+        check("导入不创建后台线程（导入无副作用）",
+              threading.active_count() == before,
+              f"{before} -> {threading.active_count()}")
+    except Exception as e:
+        check("feishu_push 可导入", False, str(e)[:120])
+        feishu_push = None
+
+    if feishu_push is not None:
+        stt = feishu_push.status()
+        # 只报通道名，不报 URL / token
+        check("飞书通道已配置", stt.get("configured") is True,
+              f"channel={stt.get('channel')}")
+        check("限速在合理范围（0 < rate <= 10 条/秒）",
+              0 < float(stt.get("rate_per_sec", 0)) <= 10,
+              f"rate={stt.get('rate_per_sec')}")
+
+        card = feishu_push.build_alert_card(
+            code="600519.SH", name="贵州茅台", alert_type="big_inflow",
+            zjl_yuan=1.234e9, zaf_pct=5.21, threshold=4.0, label="主力大额流入")
+        ok = (isinstance(card, dict)
+              and card.get("msg_type") == "interactive"
+              and isinstance(card.get("card", {}).get("header", {}).get("template"), str)
+              and bool(card.get("card", {}).get("elements")))
+        check("异动卡片构造正确", ok,
+              f"template={card.get('card', {}).get('header', {}).get('template')}")
+
+        syscard = feishu_push.build_system_card("[OK] 测试", ["一行文本"], "ok")
+        ok2 = (isinstance(syscard, dict)
+               and syscard.get("msg_type") == "interactive"
+               and bool(syscard.get("card", {}).get("elements")))
+        check("系统通知卡片构造正确", ok2)
+
+        try:
+            json.dumps(card, ensure_ascii=False)
+            json.dumps(syscard, ensure_ascii=False)
+            check("卡片可 JSON 序列化", True)
+        except Exception as e:
+            check("卡片可 JSON 序列化", False, str(e)[:120])
+
+        # 未入队就不该起 worker 线程
+        before2 = threading.active_count()
+        check("未入队时不启动发送线程", threading.active_count() == before2)
+
+    # 看板侧的飞书状态端点（只读；看板没重启到该版本就跳过）
+    st, b, ms, _ = http(f"{base}/api/feishu/status")
+    if st == 200:
+        try:
+            d = json.loads(b.decode("utf-8", "replace"))
+            check("GET /api/feishu/status 返回通道信息", "channel" in d,
+                  f"channel={d.get('channel')}")
+        except Exception as e:
+            check("GET /api/feishu/status 返回通道信息", False, str(e)[:120])
+    elif st == 404:
+        print("       (跳过：看板未重启到含 /api/feishu/status 的版本)")
 
     # ---------- 汇总 ----------
     passed = sum(1 for _, ok, _ in _results if ok)

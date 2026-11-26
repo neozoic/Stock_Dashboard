@@ -49,6 +49,21 @@ _NO_WINDOW = getattr(subprocess, "CREATE_NO_WINDOW", 0)
 PROJECT_DIR = Path(os.path.abspath(__file__)).parent.parent
 DASHBOARD_SCRIPT = PROJECT_DIR / "stock_dashboard.py"
 LOG_DIR = PROJECT_DIR / "logs"
+
+# 仓库根目录的模块：.env 加载器 + 飞书推送。
+# 用 PROJECT_DIR（abspath）而不是 resolve()，理由同上 —— resolve() 会把
+# 映射盘展开成 UNC，后续 CreateProcess 用 UNC 当 cwd 更容易出问题。
+sys.path.insert(0, str(PROJECT_DIR))
+try:
+    import env_loader
+    env_loader.load_env()
+except Exception:
+    env_loader = None
+try:
+    import feishu_push
+except Exception:
+    feishu_push = None
+
 DASHBOARD_PORT = int(os.environ.get("DASHBOARD_PORT", "8765"))
 TDX_PROCESS = os.environ.get("TDX_EXE_NAME", "TdxW.exe")
 TDX_HOME = Path(os.environ.get("TDX_HOME", r"C:\new_tdx64"))
@@ -98,6 +113,86 @@ def log(msg: str, quiet: bool = False) -> None:
     try:
         sys.stdout.write(line)
         sys.stdout.flush()
+    except Exception:
+        pass
+
+
+# ============================================================
+# 飞书通知
+# ============================================================
+# 看板/看门狗的异常事件推飞书 —— 用户不用守着 keepalive.log 看。
+#
+# 去重状态单独放 logs/keepalive_notify.json，**不碰 keepalive_state.json**：
+# 后者管的是重启限流预算，那是安全-critical 的账本，
+# 拿它记通知时间戳等于给限流逻辑埋雷。
+
+NOTIFY_STATE_FILE = LOG_DIR / "keepalive_notify.json"
+# 同类事件的冷却期（秒）。看板每 5 分钟醒一次，不冷却的话一次崩溃循环
+# 就能刷出十几张一模一样的卡片。
+NOTIFY_COOLDOWN_SEC = 1800
+
+
+def _load_notified() -> dict:
+    try:
+        with open(NOTIFY_STATE_FILE, "r", encoding="utf-8") as f:
+            data = json.load(f)
+        return data if isinstance(data, dict) else {}
+    except Exception:
+        return {}
+
+
+def _save_notified(data: dict) -> None:
+    try:
+        LOG_DIR.mkdir(parents=True, exist_ok=True)
+        tmp = NOTIFY_STATE_FILE.parent / (NOTIFY_STATE_FILE.name + ".tmp")
+        with open(tmp, "w", encoding="utf-8") as f:
+            json.dump(data, f, ensure_ascii=False)
+        os.replace(str(tmp), str(NOTIFY_STATE_FILE))
+    except Exception:
+        pass
+
+
+def notify_event(key: str, title: str, lines: list, level: str = "warn",
+                 cooldown: int = NOTIFY_COOLDOWN_SEC) -> bool:
+    """发一条飞书通知；同 key 在冷却期内只发一次（防刷屏）。
+
+    绝不抛异常 —— 通知失败不能影响看门狗的判定与自愈动作。
+    """
+    if feishu_push is None or not feishu_push.is_configured():
+        return False
+    now = time.time()
+    notified = _load_notified()
+    try:
+        last = float(notified.get(key) or 0)
+    except (TypeError, ValueError):
+        last = 0.0
+    if now - last < cooldown:
+        return False
+    try:
+        ok = feishu_push.notify_system(title, lines, level=level)
+    except Exception as e:
+        log(f"[WARN] 飞书通知失败({key}): {e}")
+        return False
+    if ok:
+        notified[key] = now
+        # 只留最近 50 条，别让文件无限长
+        if len(notified) > 50:
+            for k in sorted(notified, key=lambda k: notified[k])[:-50]:
+                notified.pop(k, None)
+        _save_notified(notified)
+    return ok
+
+
+def flush_notifications(timeout: float = 15.0) -> None:
+    """进程退出前把队列里的通知发完。
+
+    watchdog 是一次性进程（计划任务每 5 分钟起一个）—— 不显式 flush 的话，
+    守护线程会随进程退出被干掉，通知就永远发不出去。
+    """
+    if feishu_push is None:
+        return
+    try:
+        feishu_push.shutdown(timeout)
     except Exception:
         pass
 
@@ -424,6 +519,11 @@ def request_shutdown(port: int = DASHBOARD_PORT, timeout: float = 15.0) -> bool:
         req = urllib.request.Request(
             f"http://127.0.0.1:{port}/api/shutdown", data=b"", method="POST"
         )
+        # 看板设了 DASHBOARD_TOKEN 的话，/api/* 要带 Bearer —— 不带就 401，
+        # 优雅退出会失败 → 退化成强杀 → 漏掉一个 TQ 槽位。
+        token = os.environ.get("DASHBOARD_TOKEN", "").strip()
+        if token:
+            req.add_header("Authorization", f"Bearer {token}")
         with urllib.request.urlopen(req, timeout=timeout) as r:
             return r.status == 200
     except Exception:
@@ -445,6 +545,10 @@ def stop_dashboard(port: int = DASHBOARD_PORT, wait: int = 45) -> int:
                 return 0
             time.sleep(2)
         log("[WARN] 看板优雅退出超时，改为强杀")
+        notify_event("dashboard_kill", "⚠️ 看板被强杀",
+                     ["优雅退出超时（等待 %ds 端口未释放），已改为强杀" % wait,
+                      "强杀可能漏掉一个通达信 TQ 槽位"],
+                     level="warn")
     return kill_port_listeners(port)
 
 
@@ -571,9 +675,16 @@ def ensure_tdx_logged_in(wait: int = 90) -> bool:
             state = "no_dialog"
         if state == "clicked":
             log("已自动点通达信登录，等待进入行情界面")
+            notify_event("tdx_login_clicked", "🔑 通达信已自动登录",
+                         ["已自动点击登录按钮，等待进入行情界面"],
+                         level="info")
             return True
         if state == "timeout":
             log("[WARN] 已点登录但通达信未进入行情界面（可能需要账号/验证码）")
+            notify_event("tdx_login_timeout", "⚠️ 通达信自动登录超时",
+                         ["已点登录但未进入行情界面",
+                          "可能需要账号/验证码，请手动在客户端登录一次"],
+                         level="warn")
             return False
         log(f"通达信尚未就绪 (state={state})，稍后重试")
         time.sleep(5)
@@ -676,10 +787,18 @@ def start_dashboard_and_wait(st: dict = None, timeout: int = 90) -> bool:
             health = dashboard_health()
             state = health.get("tdx_health", "?")
             log(f"[OK] 看板已拉起 (port {DASHBOARD_PORT}, tdx_health={state})")
+            notify_event("dashboard_started", "✅ 看板已拉起",
+                         [f"端口 {DASHBOARD_PORT}", f"TQ 健康状态: {state}",
+                          "http://127.0.0.1:%d" % DASHBOARD_PORT],
+                         level="ok")
             ok = True
             break
     if not ok:
         log(f"[WARN] 看板已拉起，但 {timeout}s 内健康检查仍未通过 - 查 logs/dashboard.stdout.log")
+        notify_event("dashboard_start_unhealthy", "⚠️ 看板拉起后健康检查未通过",
+                     [f"{timeout}s 内 /api/health 仍未就绪",
+                      "查 logs/dashboard.stdout.log"],
+                     level="warn")
     if st is not None and ok:
         # 只有**确认起来了**才清标记；起不来时保留标记 ——
         # 窗口内不重复拉起，避免第二个触发源把刚拉起、还没 bind 端口的实例杀掉
@@ -740,21 +859,39 @@ def main() -> int:
         save_state(st)
         log(f"[WARN] 看板存活但 tdx_health={tdx_state} "
             f"(连续 {st['tdx_fail_count']}/{TDX_FAIL_THRESHOLD})")
+        notify_event("tdx_health_fail", "⚠️ 看板连不上通达信",
+                     [f"TQ 状态: {tdx_state}",
+                      f"连续失败 {st['tdx_fail_count']}/{TDX_FAIL_THRESHOLD} 次",
+                      "通达信已登录但进程内 TQ 状态可能中毒，够数后自动重启看板"],
+                     level="warn", cooldown=60)
 
         # 上一轮 TQ 未就绪就把看板拉起来了 —— 现在 TQ 好了，立刻重启一次
         pending = bool(st.pop("needs_tdx_restart", False))
         if pending:
             log("[ACTION] 上一轮 TQ 未就绪导致看板状态中毒，现在立即重启看板")
+            notify_event("tdx_poisoned_restart", "🔄 看板因 TQ 状态中毒被重启",
+                         ["上一轮 TQ 未就绪就拉起了看板，进程内状态已中毒",
+                          "现在立即重启看板以修复 TQ 连接"],
+                         level="warn")
             st["tdx_fail_count"] = 0
             save_state(st)
         if pending or st["tdx_fail_count"] >= TDX_FAIL_THRESHOLD:
             if not restart_budget_ok(st):
                 log(f"[WARN] 重启次数超限({RESTART_BURST_WINDOW}s 内 {MAX_RESTARTS_BURST} 次 / 1h 内 {MAX_RESTARTS_PER_HOUR} 次)，放弃自愈，等人工介入")
+                notify_event("restart_budget_exhausted", "🛑 自愈已停手，等人工介入",
+                             [f"重启次数超限（{RESTART_BURST_WINDOW}s 内 {MAX_RESTARTS_BURST} 次 / 1h 内 {MAX_RESTARTS_PER_HOUR} 次）",
+                              "看板不会自动重启了，需要人工介入",
+                              "处理完用 --reset-budget 清空预算"],
+                             level="error")
                 return 0
             # 重启看板前先确认 TQ 槽位还够用：槽位被烧光时重启看板只会
             # 再烧一个（还起不来），此时该做的是重启通达信重置槽位
             if not tdx_tq_ready(timeout=40) and tdx_slot_reset_allowed(st):
                 log("[ACTION] TQ 探测失败（疑似 mode 槽位耗尽），先重启通达信重置槽位")
+                notify_event("tq_slot_reset", "🔧 重启通达信以重置 TQ 槽位",
+                             ["TQ 探测失败，疑似 mode 槽位耗尽",
+                              "重启通达信客户端重置槽位（不动看板）"],
+                             level="warn")
                 kill_tdx_client(st)
                 time.sleep(3)
                 ok, pid = start_tdx_client()
@@ -765,6 +902,10 @@ def main() -> int:
                 save_state(st)
                 wait_for_tdx_ready()
             log("[ACTION] TQ 连续异常，重启看板进程")
+            notify_event("dashboard_restart_tq", "🔄 看板因 TQ 异常被重启",
+                         [f"TQ 连续异常 {TDX_FAIL_THRESHOLD} 次",
+                          "重启看板进程以恢复 TQ 连接（优雅退出，槽位能归还）"],
+                         level="warn")
             stop_dashboard()
             record_restart(st)
             st["tdx_fail_count"] = 0
@@ -795,6 +936,11 @@ def main() -> int:
     # 超限时通达信已经白重启一次，而看板反而再也不会被拉起。
     if not restart_budget_ok(st):
         log(f"[WARN] 重启次数超限({RESTART_BURST_WINDOW}s 内 {MAX_RESTARTS_BURST} 次 / 1h 内 {MAX_RESTARTS_PER_HOUR} 次)，放弃拉起，等人工介入")
+        notify_event("budget_exhausted_no_start", "🛑 看板未被拉起，等人工介入",
+                     [f"重启次数超限（{RESTART_BURST_WINDOW}s 内 {MAX_RESTARTS_BURST} 次 / 1h 内 {MAX_RESTARTS_PER_HOUR} 次）",
+                      "看板已无响应且不会自动拉起，需要人工介入",
+                      "处理完用 --reset-budget 清空预算"],
+                     level="error")
         return 0
 
     # 端口上可能还挂着不健康的僵尸实例，先清掉（活着就优雅退，退不掉再强杀）
@@ -803,6 +949,10 @@ def main() -> int:
 
     if not tdx_alive():
         log("通达信未运行，尝试拉起")
+        notify_event("tdx_not_running", "⚠️ 通达信掉线，正在拉起",
+                     ["看板无响应且通达信没在运行",
+                      "正在拉起通达信客户端并自动登录"],
+                     level="warn")
         ok, pid = start_tdx_client()
         if ok and pid:
             st["tdx_pid"] = pid
@@ -823,6 +973,10 @@ def main() -> int:
         # 只有重启通达信客户端才能重置槽位
         log("[ACTION] 通达信已登录但 TQ 探测失败，判定为 mode 槽位耗尽，"
             "重启通达信客户端重置槽位")
+        notify_event("tdx_restart_for_tq", "🔧 重启通达信以重置 TQ 槽位",
+                     ["通达信已登录但 TQ 探测失败，判定 mode 槽位耗尽",
+                      "重启通达信客户端重置槽位（不动看板）"],
+                     level="warn")
         kill_tdx_client(st)
         time.sleep(3)
         ok, pid = start_tdx_client()
@@ -836,10 +990,18 @@ def main() -> int:
             log("[OK] 重启通达信后 TQ 已就绪")
         else:
             log("[WARN] 重启通达信后 TQ 仍未就绪 —— 看板先走 akshare 兜底")
+            notify_event("tq_not_ready_after_reset", "⚠️ 重启通达信后 TQ 仍未就绪",
+                         ["槽位重置后 TQ 仍探测不到",
+                          "看板先走 akshare 兜底，TQ 就绪后下一轮会重启看板"],
+                         level="warn")
             st["needs_tdx_restart"] = True
     else:
         log("[WARN] TQ 接口未就绪 —— 看板会先走 akshare 兜底，"
             "TQ 就绪后下一轮会重启看板以修复 TQ")
+        notify_event("tq_not_ready", "⚠️ TQ 接口未就绪",
+                     ["TQ 探测失败，看板会先走 akshare 兜底",
+                      "TQ 就绪后下一轮会重启看板以修复 TQ"],
+                     level="warn")
         st["needs_tdx_restart"] = True
 
     started = start_dashboard_and_wait(st)
@@ -874,4 +1036,7 @@ if __name__ == "__main__":
             log("[ACTION] 重启限流计数已清空")
         sys.exit(main())
     finally:
+        # watchdog 是一次性进程 —— 不 flush 的话，队列里的飞书通知
+        # 会随守护线程一起被干掉，永远发不出去
+        flush_notifications(15.0)
         release_lock()
