@@ -412,6 +412,7 @@ class _Pusher:
         self.queue = Queue(maxsize=cfg.queue_max)
         self._thread = None
         self._stop = threading.Event()
+        self._stopped = False
         self._token = _TokenCache()
         self._stats = {"sent": 0, "failed": 0, "dropped": 0}
         self._dropped_since_log = 0
@@ -420,16 +421,21 @@ class _Pusher:
 
     # ---------- 生命周期 ----------
 
+    def is_stopped(self):
+        return self._stopped
+
     def start(self):
         with self._lock:
-            if self._thread is not None:
+            if self._thread is not None and not self._stopped:
                 return
+            self._stopped = False
             self._thread = threading.Thread(target=self._run, name="feishu_push",
                                             daemon=True)
             self._thread.start()
 
     def stop(self, timeout=5.0):
         """停 worker：先把队列里剩下的发完（最多 timeout 秒）"""
+        self._stopped = True
         try:
             self.queue.put_nowait(_SENTINEL)
         except Exception:
@@ -524,12 +530,14 @@ class _Pusher:
             "msg_type": msg_type,
             "content": json.dumps(content, ensure_ascii=False),
         }
-        ok, data = self._post_with_retry(
-            FEISHU_MSG_URL,
-            {"Authorization": f"Bearer {token}",
-             "Content-Type": "application/json; charset=utf-8"},
-            body,
-        )
+        headers = {
+            "Authorization": f"Bearer {token}",
+            "Content-Type": "application/json; charset=utf-8",
+        }
+        # receive_id_type 是**必填的 query 参数** —— 漏了直接
+        # 400 / code=99992402 "field validation failed"（实测踩过）
+        params = {"receive_id_type": "chat_id"}
+        ok, data = self._post_with_retry(FEISHU_MSG_URL, headers, body, params=params)
         if ok:
             return True
         if data.get("_token_invalid"):
@@ -545,6 +553,7 @@ class _Pusher:
                 {"Authorization": f"Bearer {token}",
                  "Content-Type": "application/json; charset=utf-8"},
                 body,
+                params=params,
             )
             return ok
         self._last_error = str(data.get("_err") or data.get("msg") or "发送失败")
@@ -558,7 +567,7 @@ class _Pusher:
 
     # ---------- HTTP + 重试 ----------
 
-    def _post_with_retry(self, url, headers, body):
+    def _post_with_retry(self, url, headers, body, params=None):
         """POST 并按失败类型决定重试。
 
         返回 (ok, data)；data 里可能带 _token_invalid / _err 供上层判断。
@@ -567,7 +576,7 @@ class _Pusher:
         for attempt in range(_MAX_RETRY):
             try:
                 resp = _requests().post(url, headers=headers, json=body,
-                                        timeout=_HTTP_TIMEOUT)
+                                        params=params, timeout=_HTTP_TIMEOUT)
             except Exception as e:
                 last_err = f"{type(e).__name__}"
                 logger.warning("飞书请求异常(第 %d 次): %s", attempt + 1, last_err)
@@ -610,9 +619,15 @@ class _Pusher:
                     continue
                 return False, {"_err": last_err}
 
-            # 其它 4xx：配置错，重试没意义
-            logger.error("飞书 HTTP %s（不重试）", code)
-            return False, {"_err": f"HTTP {code}"}
+            # 其它 4xx：配置错，重试没意义。
+            # 把响应体截断记下来 —— 飞书的报错信息在 body 里（不含密钥）
+            body_text = ""
+            try:
+                body_text = resp.text[:300]
+            except Exception:
+                pass
+            logger.error("飞书 HTTP %s（不重试）: %s", code, body_text)
+            return False, {"_err": f"HTTP {code} {body_text}"}
 
         return False, {"_err": last_err}
 
@@ -640,7 +655,9 @@ _PUSHER_LOCK = threading.Lock()
 def _get_pusher():
     global _PUSHER
     with _PUSHER_LOCK:
-        if _PUSHER is None:
+        if _PUSHER is None or _PUSHER.is_stopped():
+            # 已经停掉的 pusher 不能复用 —— 它的 worker 线程已经退出，
+            # 队列里还压着 sentinel，重新 start 会立刻被 sentinel 带走
             _ensure_file_log()
             cfg = _config()
             _PUSHER = _Pusher(cfg)
@@ -727,11 +744,14 @@ def status():
 
 
 def shutdown(timeout=5.0):
-    """退出前把队列里剩下的消息发完（必须在 os._exit 之前调用）"""
-    global _PUSHER
+    """退出前把队列里剩下的消息发完（必须在 os._exit 之前调用）
+
+    注意：**不清空 _PUSHER** —— 清掉的话 status() 就查不到本次的
+    发送计数了（一次性进程里这正是最想看到的）。
+    下次 enqueue 时 _get_pusher() 会发现它已停止，自动换一个新的。
+    """
     with _PUSHER_LOCK:
         pusher = _PUSHER
-        _PUSHER = None
     if pusher is None:
         return
     try:
