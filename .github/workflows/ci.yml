@@ -43,3 +43,17 @@ jobs:
             exit 1
           fi
           echo "✓ 无 .env 被跟踪"
+
+      - name: 确认模板里没有真密钥
+        run: |
+          # .env.example 是公开仓库里的模板 —— 里面的 secret 必须是空的，
+          # 否则谁手滑填一次就等于把飞书 app_secret 推给了全世界
+          if grep -E '^FEISHU_APP_SECRET=.+' .env.example >/dev/null 2>&1; then
+            echo "❌ .env.example 里的 FEISHU_APP_SECRET 不是空值"
+            exit 1
+          fi
+          if grep -E '^STOCK_FLOW_FEISHU_WEBHOOK=.+' .env.example >/dev/null 2>&1; then
+            echo "❌ .env.example 里的 STOCK_FLOW_FEISHU_WEBHOOK 不是空值"
+            exit 1
+          fi
+          echo "✓ 模板里没有真密钥"

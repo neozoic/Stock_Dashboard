@@ -2,6 +2,63 @@
 
 本项目遵循 [语义化版本](https://semver.org/lang/zh-CN/)。
 
+## [0.3.0] - 2026-11-26
+
+### 新增
+- **飞书推送真的发出去了** —— 以前 `send_feishu_text` 从未成功过（`STOCK_FLOW_FEISHU_WEBHOOK`
+  从没配过，所有异动都落到 stdout 分支；日志里累计 5367 条异动一条没进飞书）
+  - 新增 `feishu_push.py`：通道选择 + token 缓存 + 卡片构造 + 队列 + 限速 + 重试
+  - 两条通道：**飞书自建应用**（`FEISHU_APP_ID`/`FEISHU_APP_SECRET`/`FEISHU_CHAT_ID`，
+    支持 interactive 卡片）与**群机器人 webhook**（`STOCK_FLOW_FEISHU_WEBHOOK`，沿用旧名）
+  - `FEISHU_MODE`：`auto`（优先 app）/ `app` / `webhook` / `both` / `off`
+  - 异动以**卡片**呈现：红涨绿跌（沿用看板配色 `#F2435E`/`#28BC86`），
+    含主力净流入、涨幅、触发阈值、时间
+  - **看门狗系统通知**：看板拉起、通达信掉线、TQ 槽位重置、重启看板、
+    限流耗尽等 13 个事件点 → 飞书卡片；同类事件 30 分钟冷却（去重状态独立存
+    `logs/keepalive_notify.json`，不碰重启限流账本）
+  - `tools/feishu_test.py` 自检 CLI（`--status` 只看状态、`--alert` 看异动卡片样式）
+  - 新端点：`GET /api/feishu/status`、`POST /api/feishu/test`（仅本机 loopback）
+  - `/api/alerts` 增加 `feishu` 段 —— 推送失败在看板上看得见
+- **`.env` 自动加载**（新增 `env_loader.py`）
+  - 复制 `.env.example` 为 `.env` 填写即可，**密钥不再需要 setx 或改 bat**
+  - 优先级：真正的环境变量 > `.env`
+  - `.env` 已被 `.gitignore` 排除，不会入库
+
+### 修复
+- **飞书推送阻塞告警监测线程**（巡检 P1-13）
+  - 原来 `send_feishu_text` 是同步 `requests.post(timeout=10)`，直接跑在
+    告警扫描线程与实时订阅线程里。本机外网对 `open.feishu.cn` 间歇性不通，
+    每条告警阻塞 10 秒；实测峰值 193 条/60 秒 → 扫描线程最坏卡 32 分钟，
+    订阅线程卡住等于实时推送全线停摆
+  - 现在改为**入队即返回 + 后台线程限速发送**（默认 1.5 条/秒），推送再慢也拖不垮监测
+  - 失败自动退避重试（网络异常/429/5xx 重试 3 次；token 失效刷新后重试 1 次；
+    权限配置类错误不重试），重试失败只记日志，**绝不抛异常到调用方**
+  - 队列有上限（默认 1000），满了丢弃新消息并汇总记日志 —— 告警可丢，看板不卡
+- **`os._exit(0)` 跳过推送收尾** —— 关停流程里显式 `feishu_push.shutdown(5.0)`，
+  在 `os._exit` 之前把队列发完（否则排队中的告警全丢）
+- **watchdog 一次性进程丢通知** —— watchdog 退出前显式 flush 队列
+  （它是计划任务每 5 分钟起一个的一次性进程，不 flush 守护线程随进程死）
+- **`/api/shutdown` 会丢 TQ 槽位** —— watchdog 的关停请求现在带 Bearer token
+  （看板若设了 `DASHBOARD_TOKEN`，原来会 401 → 优雅退出失败 → 退化成强杀 → 漏槽位）
+
+### 变更
+- `alert_monitor.send_feishu_text()` 语义变为**入队即返回**（非阻塞）；
+  新增 `send_feishu_alert(alert)` 走卡片通道
+- `alert_monitor` 的 `FEISHU_WEBHOOK` 常量保留（外部脚本可能读），
+  但删掉了 import 期的 WARNING（改由 `feishu_push` 惰性判断）
+- `stock_dashboard.py` 顶部会加载 `.env`（早于代理清理块，
+  这样 `.env` 里的 `DASHBOARD_KEEP_PROXY=1` 才生效）
+- `tools/smoke_test.py` 增至 33 项（新增第 10 组：飞书推送模块，全离线检查）
+- README：「不在本项目内」一节区分了本仓库自带的逐条推送与仍在仓库外的
+  汇总/排行脚本
+
+### 已知
+- `open.feishu.cn` 在本网络**间歇性不通**（DNS 解析失败、连接被拒，
+  11-22 / 11-23 / 11-24 均有记录）。推送侧已做重试退避与丢弃，
+  不通时**不影响**看板与告警监测，但当次告警会丢
+- 飞书**群维度 5 QPS 是群内共享**的，限速默认 1.5 条/秒以留余量；
+  开盘瞬间 193 条/60 秒的峰值需要约 2 分钟才发完（队列吸收积压）
+
 ## [0.2.0] - 2026-11-25
 
 ### 新增

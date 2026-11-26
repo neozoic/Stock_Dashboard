@@ -1,6 +1,6 @@
 # A 股资金流实时看板（Stock_Dashboard）
 
-> 版本 **v0.2.0**　|　更新日志见 [CHANGELOG.md](CHANGELOG.md)
+> 版本 **v0.3.0**　|　更新日志见 [CHANGELOG.md](CHANGELOG.md)
 
 [![GitHub](https://img.shields.io/badge/GitHub-neozoic%2FStock__Dashboard-181717?logo=github)](https://github.com/neozoic/Stock_Dashboard)
 [![Gitee](https://img.shields.io/badge/Gitee-neozoic%2Fstock__dashboard-c71d23?logo=gitee)](https://gitee.com/neozoic/stock_-dashboard)
@@ -21,14 +21,17 @@ Stock_Dashboard/
 ├── stock_dashboard.py          # 主后端（HTTP 服务，端口默认 8765）
 ├── tdx_client.py               # 通达信 TdxQuant 封装
 ├── alert_monitor.py            # 实时异动监测
+├── feishu_push.py              # 飞书推送（异步队列 + 卡片）
+├── env_loader.py               # .env 加载器
 ├── dashboard.html              # 前端（ECharts 5.4.3）
 ├── echarts.min.js              # 本地 ECharts（已预下载，断网可用）
 ├── start_dashboard.bat         # Windows 启动脚本
-├── .env.example                # 环境变量示例
+├── .env.example                # 环境变量示例（复制成 .env 后填写）
 ├── README.md                   # 本文件
 ├── logs/                       # stdout/stderr 日志输出
 ├── tools/
 │   ├── dashboard_watchdog.py   # 看板 watchdog（权威版；.hermes 副本为 wrapper）
+│   ├── feishu_test.py          # 飞书推送自检 CLI
 │   └── auto_sync.py 等          # 目录变动自动同步 GitHub/Gitee
 └── archive/
     └── stock_dashboard_tdx.py  # 旧版主程序（已停用，仅作历史参考）
@@ -93,10 +96,29 @@ python stock_dashboard.py
 | `DASHBOARD_PORT` | `8765` | 看板 HTTP 端口 |
 | `DASHBOARD_BIND` | `127.0.0.1` | 绑定地址；两个 .bat 启动脚本显式设为 `0.0.0.0` 以便局域网访问，公网环境务必改回 |
 | `DASHBOARD_KEEP_PROXY` | `0` | `1`=保留系统代理；默认会清掉代理环境变量 |
-| `STOCK_FLOW_FEISHU_WEBHOOK` | （空） | 飞书机器人 webhook；不填则异动仅输出 stdout |
+| `FEISHU_MODE` | `auto` | 飞书通道：`auto`（优先 app，缺 app 凭据则退 webhook）/ `app` / `webhook` / `both` / `off` |
+| `FEISHU_APP_ID` / `FEISHU_APP_SECRET` / `FEISHU_CHAT_ID` | （空） | 飞书自建应用通道（支持卡片消息，推荐）|
+| `STOCK_FLOW_FEISHU_WEBHOOK` | （空） | 飞书群机器人 webhook；不填则该通道不可用 |
+| `FEISHU_RATE_PER_SEC` | `1.5` | 飞书推送限速（条/秒）。飞书群的 5 QPS 是群内共享的，别占满 |
+| `FEISHU_QUEUE_MAX` | `1000` | 推送队列上限；满了丢弃新消息（告警可丢，看板不卡）|
 | `TDX_SEND_WARN` | `1` | 异动信号回推通达信 TQ 策略信号窗口（tq.send_warn）；`0`=关闭 |
 
-修改 `.env.example` 或在 `start_dashboard.bat` 中调整默认值。
+配置方式：把 `.env.example` 复制成 `.env` 后填写（**看板启动时会自动加载**，
+`.env` 已被 gitignore 排除，不会入库）。真正的环境变量优先级高于 `.env`。
+也可以直接改 `start_dashboard.bat` 里的默认值。
+
+### 飞书推送
+
+异动告警与看板/看门狗的系统事件会推成**飞书卡片**。
+
+- **通道**：自建应用（`FEISHU_APP_ID`/`FEISHU_APP_SECRET`/`FEISHU_CHAT_ID`）
+  或群机器人 webhook（`STOCK_FLOW_FEISHU_WEBHOOK`），由 `FEISHU_MODE` 决定。
+- **异步**：入队即返回，后台线程限速发送。推送再慢也不会拖垮告警扫描线程
+  （以前是同步 `requests.post`，外网不通时每条阻塞 10 秒 —— 巡检 P1-13）。
+- **容错**：网络异常/429/5xx 自动退避重试；重试失败只记日志，绝不影响监测主流程。
+- **自检**：`python tools/feishu_test.py`（发一条测试卡片）、`--status`（只看状态）。
+- **诊断端点**：`POST /api/feishu/test`（仅本机）、`GET /api/feishu/status`。
+- 推送日志：`logs/feishu.log`。
 
 ## HTTP 接口
 
@@ -107,7 +129,10 @@ python stock_dashboard.py
 | `/api/data` | GET | 最新快照：`stock_top/bottom`、`industry_top/bottom`、`concept_top/bottom` |
 | `/api/trend` | GET | 趋势数据：`timestamps`、`stock`、`industry`、`concept`、`market` |
 | `/api/history` | GET | 全部历史（仅开发用） |
-| `/api/alerts` | GET | 实时异动监测状态 |
+| `/api/alerts` | GET | 实时异动监测状态（含 `feishu` 推送通道与计数）|
+| `/api/feishu/status` | GET | 飞书推送通道、队列深度、已发/失败/丢弃计数 |
+| `/api/feishu/test` | POST | 发一条飞书测试卡片（仅本机 loopback）|
+| `/api/shutdown` | POST | 优雅关停（仅本机 loopback）。**必须走它而不是 taskkill** —— 强杀会漏掉通达信 TQ 槽位，4 个烧光 TQ 就再也起不来 |
 | `/api/minute?code=600519.SH&period=1m&count=N` | GET | 单股/板块 K线分时（TDX 本地数据；无数据返回空数组，TDX 不可用 503）|
 | `/api/indicator?code=600519.SH&formula=KDJ&arg=9,3,3` | GET | 内置公式指标（MA/KDJ/MACD/BOLL/VOL/RSI/WR/DMA/ASI；白名单外 400，TDX 不可用 503）|
 
@@ -245,7 +270,8 @@ python tools\install_keepalive.py --uninstall      :: 卸载全部任务与自�
 | ECharts 渲染失败 | `echarts.min.js` 缺失 | 已预下载到同目录；如需恢复 CDN 引用，编辑 `dashboard.html` 头部 `<script>` |
 | 0.0.0.0 暴露公网 | 共享/容器网络 | `DASHBOARD_BIND=127.0.0.1` 或经反向代理 |
 | 公司代理 | 默认清代理导致外网拉取失败 | 启动前 `set DASHBOARD_KEEP_PROXY=1` |
-| 飞书推送未生效 | 未设 `STOCK_FLOW_FEISHU_WEBHOOK` | 启动时会在日志里 WARNING |
+| 飞书推送未生效 | `.env` 没配通道凭据 | `python tools/feishu_test.py --status` 看通道；日志在 `logs/feishu.log` |
+| 飞书发不出去（本机网络） | `open.feishu.cn` 间歇性不通 | 推送是异步的，不通也**不影响**看板与告警监测；恢复后自动重试 |
 
 ## 迁移历史
 
@@ -256,6 +282,7 @@ python tools\install_keepalive.py --uninstall      :: 卸载全部任务与自�
 
 ## 不在本项目内
 
-- 飞书推送独立系统（`stock_flow_push*.py`、`stock_flow_summary.py`、`stock_flow_rank.py`）
+- 飞书的**汇总/排行**脚本（`stock_flow_summary.py`、`stock_flow_rank.py`）——
+  本仓库自己带的是**逐条异动 + 系统事件**推送（`feishu_push.py`）
 - 通达信客户端二进制（仍装在 `C:\new_tdx64`）
 - Hermes 框架（`.hermes\`）

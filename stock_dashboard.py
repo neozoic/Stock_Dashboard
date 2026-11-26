@@ -65,7 +65,7 @@ warnings.filterwarnings("ignore")
 # ("Device or resource busy")；退化成截断又会因写入方偏移量不回退，
 # 在文件头留下一整段 NUL 空洞(实测 2.9MB 里 2.86MB 是空洞)。
 # 交给 Python 自己管：轮转时先 close 再 rename，Windows 上可行且无空洞。
-__version__ = "0.2.0"
+__version__ = "0.3.0"
 
 LOG_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "logs")
 LOG_MAX_BYTES = int(os.environ.get("DASHBOARD_LOG_MAX_BYTES", 8 * 1024 * 1024))
