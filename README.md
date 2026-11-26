@@ -101,6 +101,7 @@ python stock_dashboard.py
 | `STOCK_FLOW_FEISHU_WEBHOOK` | （空） | 飞书群机器人 webhook；不填则该通道不可用 |
 | `FEISHU_RATE_PER_SEC` | `1.5` | 飞书推送限速（条/秒）。飞书群的 5 QPS 是群内共享的，别占满 |
 | `FEISHU_QUEUE_MAX` | `1000` | 推送队列上限；满了丢弃新消息（告警可丢，看板不卡）|
+| `FEISHU_ALERT_TYPES` | `big_inflow,big_outflow,limit_up,limit_down` | 只推这几类异动到飞书；留空=全推。默认排除 `price_jump`（量最大但信息密度最低）|
 | `TDX_SEND_WARN` | `1` | 异动信号回推通达信 TQ 策略信号窗口（tq.send_warn）；`0`=关闭 |
 
 配置方式：把 `.env.example` 复制成 `.env` 后填写（**看板启动时会自动加载**，
