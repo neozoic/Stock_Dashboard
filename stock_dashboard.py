@@ -25,6 +25,16 @@ A 股资金流实时看板 - 后端 (通达信 TdxQuant 数据源)
 """
 import os
 import sys
+
+# 加载 .env（必须在下面的代理清理块之前 —— 否则 .env 里的 DASHBOARD_KEEP_PROXY
+# 不生效；也必须早于 DASHBOARD_TOKEN / alert_monitor 的模块级环境变量读取）。
+# .env 已被 .gitignore 排除，是放密钥（飞书 app_secret 等）的正确位置。
+try:
+    import env_loader
+    env_loader.load_env()
+except Exception:
+    pass
+
 # 默认行为：强制清代理环境变量，避免公司/系统代理干扰 TDX 与 akshare 数据源。
 # 若新机器需要保留代理（如企业代理访问 akshare），可在启动前设置：
 #   set DASHBOARD_KEEP_PROXY=1
@@ -180,10 +190,20 @@ except Exception as e:
 def _notify_tdx_down(message: str):
     """通达信客户端不可用时的通知回调 — 写日志 + 飞书消息
 
-    当前阶段：只写日志（看板进程没接飞书 webhook）
-    推送脚本会接管真正的飞书通知
+    写日志是必须的（本地排查靠它）；飞书推送走 feishu_push 的队列，
+    入队即返回，绝不在这里做网络 IO —— 这个回调跑在通达信守护的
+    同步路径上，卡住会拖慢看板启动。
     """
     logger.error("[CRITICAL] %s", message)
+    try:
+        import feishu_push
+        feishu_push.notify_system(
+            "🚨 通达信客户端不可用",
+            [message, "看板将持续报错直到客户端可用"],
+            level="error",
+        )
+    except Exception as e:
+        logger.warning("通达信异常通知推送失败: %s", e)
 
 
 # 看板启动时做一次通达信守护（如果客户端未运行则尝试启动）
@@ -212,6 +232,8 @@ API_TOKEN = os.environ.get("DASHBOARD_TOKEN", "").strip()
 # 原来固定发 `Access-Control-Allow-Origin: *` —— 任意外部页面都能跨域读本机
 # 看板数据（2026-11-22 巡检 P2-25）。确有跨域需求时显式指定来源。
 CORS_ORIGIN = os.environ.get("DASHBOARD_CORS_ORIGIN", "").strip()
+# 看板端口（提为模块级常量，好让 handler 里的诊断端点能引用）
+DASHBOARD_PORT = int(os.environ.get("DASHBOARD_PORT", "8765"))
 
 # ============================================================
 # 大盘概览（综合选股页）
@@ -1380,24 +1402,87 @@ class Handler(BaseHTTPRequestHandler):
         # 屏蔽 BaseHTTPRequestHandler 默认的 stderr access log（刷屏且无级别）
         pass
 
-    def do_POST(self):
-        """只提供优雅关停（仅限本机 loopback 调用）。
+    def _is_loopback(self) -> bool:
+        """判断请求是否来自本机回环。
 
-        为什么需要它：通达信每个 TQ mode 只有一个槽位，持有它的进程被
-        强杀时槽位不会释放（init 直接返回"返回ID小于0"）——每重启一次看板
+        用真实 TCP 对端地址判断，**不读** X-Forwarded-For / Host ——
+        那两个头是客户端可以伪造的，伪造了就能从外网调本机接口。
+        """
+        client_ip = self.client_address[0] if self.client_address else ""
+        return client_ip in ("127.0.0.1", "::1", "::ffff:127.0.0.1")
+
+    def do_POST(self):
+        """POST 接口：优雅关停 + 飞书推送自检（都仅限本机 loopback 调用）。
+
+        /api/shutdown 为什么需要它：通达信每个 TQ mode 只有一个槽位，持有它的
+        进程被强杀时槽位不会释放（init 直接返回"返回ID小于0"）——每重启一次看板
         就烧掉一个槽位，4 个烧光后 TQ 就再也起不来。走优雅退出（关线程 +
         tdx_client.close()）才会正常归还槽位。keepalive 重启看板前先调这里。
         """
-        if self.path != "/api/shutdown":
+        from urllib.parse import urlsplit
+        route = urlsplit(self.path).path
+        if route.startswith("/api/") and not self._auth_ok():
+            self._send_json_response(
+                401,
+                {"ok": False, "code": 401, "error": "unauthorized",
+                 "message": "需要 Authorization: Bearer <token>"},
+                extra_headers={"WWW-Authenticate": "Bearer"},
+            )
+            return
+
+        if route == "/api/feishu/test":
+            self._serve_feishu_test()
+            return
+
+        if route != "/api/shutdown":
             self._send_json_response(404, {"ok": False, "code": 404, "error": "not_found"})
             return
-        client_ip = self.client_address[0] if self.client_address else ""
-        if client_ip not in ("127.0.0.1", "::1", "::ffff:127.0.0.1"):
-            logger.warning("拒绝非本机的关停请求: %s", client_ip)
+        if not self._is_loopback():
+            logger.warning("拒绝非本机的关停请求: %s", self.client_address)
             self._send_json_response(403, {"ok": False, "code": 403, "error": "forbidden"})
             return
         self._send_json_response(200, {"ok": True, "action": "shutdown"})
         threading.Thread(target=_trigger_shutdown, daemon=True).start()
+
+    def _serve_feishu_test(self):
+        """POST /api/feishu/test — 发一条测试卡片到飞书，验证推送链路
+
+        仅限本机 loopback + 走可选 Bearer 鉴权。用途：随时确认"飞书到底通没通"，
+        不用等交易时段产生真实异动。
+        """
+        if not self._is_loopback():
+            logger.warning("拒绝非本机的飞书测试请求: %s", self.client_address)
+            self._send_json_response(403, {"ok": False, "code": 403, "error": "forbidden"})
+            return
+        try:
+            import feishu_push
+        except Exception as e:
+            self._send_json_response(500, {"ok": False, "code": 500,
+                                           "error": "feishu_push_unavailable",
+                                           "message": str(e)})
+            return
+        if not feishu_push.is_configured():
+            self._send_json_response(200, {
+                "ok": False, "code": 200, "error": "not_configured",
+                "message": "未配置飞书通道（.env 里填 FEISHU_APP_ID/FEISHU_APP_SECRET/"
+                           "FEISHU_CHAT_ID，或设 STOCK_FLOW_FEISHU_WEBHOOK）",
+            })
+            return
+        try:
+            queued = feishu_push.notify_system(
+                "✅ 飞书推送自检",
+                [f"来自看板 http://127.0.0.1:{DASHBOARD_PORT}",
+                 f"通道: {feishu_push.channel_name()}",
+                 f"时间: {datetime.now(BJ_TZ).strftime('%Y-%m-%d %H:%M:%S')} (北京)"],
+                level="ok",
+            )
+        except Exception as e:
+            logger.error("飞书自检推送失败: %s", e)
+            self._send_json_response(500, {"ok": False, "code": 500,
+                                           "error": "push_failed"})
+            return
+        self._send_json_response(200, {"ok": bool(queued), "queued": bool(queued),
+                                       "channel": feishu_push.channel_name()})
 
     def _send_json_response(self, status, payload, extra_headers=None):
         """统一 JSON 响应出口（含错误响应）。
@@ -1497,6 +1582,8 @@ class Handler(BaseHTTPRequestHandler):
             self._serve_health()
         elif route == "/api/alerts":
             self._serve_alerts()
+        elif route == "/api/feishu/status":
+            self._serve_feishu_status()
         elif route.startswith("/api/minute"):
             self._serve_minute()
         elif route.startswith("/api/index/kline"):
@@ -2059,9 +2146,25 @@ class Handler(BaseHTTPRequestHandler):
                 "scan_interval_sec": getattr(m, "scan_interval_sec", None),
                 "hot_watchlist_sample": sorted(m._hot_watchlist)[:10],
             }
+        # 飞书推送状态也挂在这儿 —— 推送失败要能在看板上看到，
+        # 而不是只埋在 logs/feishu.log 里
+        try:
+            import feishu_push
+            payload["feishu"] = feishu_push.status()
+        except Exception as e:
+            payload["feishu"] = {"error": str(e)[:200]}
         data = json.dumps(payload, ensure_ascii=False).encode("utf-8")
         # 走统一出口（CORS 收敛 + no-store + 断连保护）
         self._send_json_data(200, data)
+
+    def _serve_feishu_status(self):
+        """GET /api/feishu/status — 飞书推送通道与队列状态"""
+        try:
+            import feishu_push
+            payload = feishu_push.status()
+        except Exception as e:
+            payload = {"ok": False, "error": str(e)[:200]}
+        self._send_json_response(200, payload)
 
 
 def _safe_close_tdx() -> None:
@@ -2088,7 +2191,7 @@ def _is_port_in_use(port, host="127.0.0.1", timeout=1.5):
 def main(port=None, fetch_interval=180):
     # 端口 / 绑定可通过环境变量覆盖
     if port is None:
-        port = int(os.environ.get("DASHBOARD_PORT", "8765"))
+        port = DASHBOARD_PORT
     bind_host = os.environ.get("DASHBOARD_BIND", "127.0.0.1")  # 默认仅本机；局域网访问需显式设 0.0.0.0
 
     # 启动前端口占用自检：占用时直接报错退出，提示如何清理残留进程
@@ -2209,6 +2312,13 @@ def main(port=None, fetch_interval=180):
             if closer.is_alive():
                 logger.warning("[stop] TDX 关闭超时（10s），槽位可能泄漏")
                 stuck.append("tdx_client.close")
+        # 把飞书队列里没发完的消息补发掉。
+        # 必须放在 os._exit(0) 之前 —— os._exit 不跑 atexit，队列里的消息会全丢。
+        try:
+            import feishu_push
+            feishu_push.shutdown(5.0)
+        except Exception as e:
+            logger.warning("[stop] 飞书推送收尾异常: %s", e)
         print("[stop] 退出完成", flush=True)
         if stuck:
             # 后台线程卡在 TQ 调用里退不出来时，它们是非守护线程 —— 解释器会
