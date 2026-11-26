@@ -36,6 +36,20 @@ logger = logging.getLogger("alert_monitor")
 # （走队列异步发，支持自建应用通道 + 群机器人 webhook 两条路）。
 FEISHU_WEBHOOK = os.environ.get("STOCK_FLOW_FEISHU_WEBHOOK", "").strip()
 
+# === 飞书推送的异动类型白名单 ===
+# 逗号分隔；留空 = 全推。
+# 默认只推"更重要"的那几类：主力大额流入/流出 + 触及涨跌停。
+# price_jump（价格异动）量最大但信息密度最低 —— 实测 2026-11-26
+# 它占全天异动的 33%（2064/6322），而真正值得看的涨跌停才 497 只。
+# turnover_spike 同理。想收就在这里加回去，例如：
+#   FEISHU_ALERT_TYPES=big_inflow,big_outflow,limit_up,limit_down,price_jump
+FEISHU_ALERT_TYPES = {
+    t.strip() for t in os.environ.get(
+        "FEISHU_ALERT_TYPES",
+        "big_inflow,big_outflow,limit_up,limit_down",
+    ).split(",") if t.strip()
+}
+
 # === 通达信 TQ 信号窗口回推（tq.send_warn）===
 # 默认开启；设 TDX_SEND_WARN=0 关闭。推送失败只记日志，绝不影响异动监测主流程。
 TDX_SEND_WARN = os.environ.get("TDX_SEND_WARN", "1").strip() != "0"
@@ -46,6 +60,35 @@ MAX_HOT_SUBSCRIBE = 100
 # 涨跌停检测：zaf 绝对值 ≥ LIMIT_TRIGGER_PCT 视为触及涨跌停，记录阈值 ±LIMIT_FULL_PCT
 LIMIT_TRIGGER_PCT = 9.9
 LIMIT_FULL_PCT = 10.0
+
+# 各板块的涨跌停幅度（%）。
+# 原来固定 ±9.9% —— 20cm 板（科创板/创业板）跌 9.9% 根本不是跌停，
+# 却照样被判"触及跌停"。实测今天有 234 只 20cm 板进了跌停告警，
+# 一半以上是假的（巡检遗留项：涨跌停不区分板块）。
+LIMIT_PCT_MAIN = 10.0      # 主板（沪 60x / 深 00x / 001 / 002 / 003）
+LIMIT_PCT_STAR = 20.0      # 科创板 688 / 689
+LIMIT_PCT_CHINEXT = 20.0   # 创业板 300 / 301
+LIMIT_PCT_BSE = 30.0       # 北交所（8 开头 / 43 / 83 / 87 / 88 / 92）
+LIMIT_PCT_ST = 5.0         # ST / *ST
+
+
+def limit_pct_for(code: str, name: str = "") -> float:
+    """按板块返回该股的涨跌停幅度（%）。
+
+    ST 优先 —— ST 股的涨跌幅限制跟着股票名称走（名字里带 ST 或 *ST）。
+    判不出名字就按代码前缀判；都判不出就按主板 10% 走。
+    """
+    nm = (name or "").upper().replace(" ", "")
+    if "ST" in nm:
+        return LIMIT_PCT_ST
+    c = (code or "").split(".")[0]
+    if c.startswith(("688", "689")):
+        return LIMIT_PCT_STAR
+    if c.startswith(("300", "301")):
+        return LIMIT_PCT_CHINEXT
+    if c.startswith(("8", "43", "83", "87", "88", "92")):
+        return LIMIT_PCT_BSE
+    return LIMIT_PCT_MAIN
 
 
 # ============================================================
@@ -162,19 +205,60 @@ def in_trading_hours(now=None) -> bool:
 class Throttler:
     """每只股票 + 异动类型 组合，5 分钟最多推 1 次。
 
-    另外加**日级去重**：同一 code + 类型 + 涨幅，只推一次/天。
+    另外加**日级去重**：同一 code + 类型，只推一次/天。
     原来只有 5 分钟窗口 —— 一只涨停股从 9:30 到 15:00 能被推 60 多次，
     全市场扫描一轮能产生几千条推送（巡检 P1-12）。
+
+    ⚠️ 日级去重的 key **不能带涨幅**：涨停股的 zaf 会从 10.00 漂到 10.02，
+    带上 price 就每次都命中不了 —— 这个去重从上线起就没生效过，
+    实测 2026-11-26 一只票（688802.SH）一天被推了 22 遍跌停。
+
+    日级去重集合**落盘**（logs/alert_dedupe.json）：只放内存里的话，
+    看板一重启就清空 → 今天已经推过的几百只票会全部重推一遍，
+    等于把用户刚收过的告警再刷一次。
     """
 
-    def __init__(self, interval_sec: float = 300):
+    def __init__(self, interval_sec: float = 300, state_file: str = None):
         self.interval = interval_sec
         self._last_sent: Dict[str, float] = {}
         self._daily_sent: Set[str] = set()
         self._daily_key = ""
         self._lock = threading.Lock()
+        self._state_file = state_file or os.path.join(
+            os.path.dirname(os.path.abspath(__file__)), "logs", "alert_dedupe.json")
+        self._load_daily()
+
+    # ---------- 日级去重的落盘 ----------
+
+    def _load_daily(self) -> None:
+        """读回当天已推过的组合（换天就丢弃）"""
+        today = datetime.now(timezone(timedelta(hours=8))).strftime("%Y-%m-%d")
+        self._daily_key = today
+        try:
+            with open(self._state_file, "r", encoding="utf-8") as f:
+                data = json.load(f)
+        except Exception:
+            return
+        if not isinstance(data, dict) or data.get("day") != today:
+            return
+        items = data.get("sent")
+        if isinstance(items, list):
+            self._daily_sent = {str(x) for x in items}
+
+    def _save_daily(self) -> None:
+        """原子写（tmp + replace）：文件损坏等于去重失效 → 会被当成全部重推"""
+        try:
+            os.makedirs(os.path.dirname(self._state_file), exist_ok=True)
+            tmp = self._state_file + ".tmp"
+            with open(tmp, "w", encoding="utf-8") as f:
+                json.dump({"day": self._daily_key, "sent": sorted(self._daily_sent)},
+                          f, ensure_ascii=False)
+            os.replace(tmp, self._state_file)
+        except Exception:
+            pass
 
     def should_send(self, code: str, alert_type: str, price=None) -> bool:
+        # price 保留是为了兼容旧调用签名，但**不参与**去重 key（见上面说明）
         key = f"{code}:{alert_type}"
         now = time.time()
         day = datetime.now(timezone(timedelta(hours=8))).strftime("%Y-%m-%d")
@@ -182,15 +266,16 @@ class Throttler:
             if self._daily_key != day:
                 self._daily_key = day
                 self._daily_sent.clear()
+                self._save_daily()
             last = self._last_sent.get(key, 0)
             if now - last < self.interval:
                 return False
-            if price is not None:
-                day_key = f"{day}|{key}|{price}"
-                if day_key in self._daily_sent:
-                    return False
-                self._daily_sent.add(day_key)
+            day_key = f"{day}|{key}"
+            if day_key in self._daily_sent:
+                return False
+            self._daily_sent.add(day_key)
             self._last_sent[key] = now
+            self._save_daily()
             return True
 
 
@@ -251,11 +336,13 @@ class AlertDetector:
                 extra={'zjl_yi': zjl / 1e8}
             ))
 
-        # 2. 涨跌停（zaf 接近 ±10%）
-        if self.limit_up_trigger and zaf >= LIMIT_TRIGGER_PCT:
-            alerts.append(Alert(code, name, AlertType.LIMIT_UP, zjl, zaf, LIMIT_FULL_PCT))
-        if self.limit_down_trigger and zaf <= -LIMIT_TRIGGER_PCT:
-            alerts.append(Alert(code, name, AlertType.LIMIT_DOWN, zjl, zaf, -LIMIT_FULL_PCT))
+        # 2. 涨跌停（按板块判定幅度：主板 10% / 创业板科创板 20% / 北交所 30% / ST 5%）
+        full_pct = limit_pct_for(code, name)
+        trigger_pct = full_pct - 0.1
+        if self.limit_up_trigger and zaf >= trigger_pct:
+            alerts.append(Alert(code, name, AlertType.LIMIT_UP, zjl, zaf, full_pct))
+        if self.limit_down_trigger and zaf <= -trigger_pct:
+            alerts.append(Alert(code, name, AlertType.LIMIT_DOWN, zjl, zaf, -full_pct))
 
         # 3. 价格异动（和上次比）
         with self._lock:
@@ -300,7 +387,10 @@ def send_feishu_alert(alert):
     """把一条异动告警推给飞书（非阻塞：入队即返回）
 
     走卡片格式 —— 异动量很大，纯文本在群里根本扫不出重点。
+    只有 FEISHU_ALERT_TYPES 白名单里的类型才推（"只推更重要的"）。
     """
+    if FEISHU_ALERT_TYPES and alert.alert_type not in FEISHU_ALERT_TYPES:
+        return False
     if not feishu_push.is_configured():
         # 没配通道时退回 stdout，保留本地排查能力
         print(f"\n{alert.to_markdown()}\n", flush=True)
