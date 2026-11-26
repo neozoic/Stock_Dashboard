@@ -5,7 +5,7 @@
 - 候选池股票（最多 100 只）订阅通达信实时推送
 - 回调触发后主动 get_more_info 拿资金流
 - 检测异动（主力大额流入、涨跌停、涨幅突变）
-- 通过飞书 webhook 推送（如果配了）或 stdout 输出
+- 异动以卡片形式推飞书（入队异步，限速发送，不阻塞监测线程）；未配通道时输出到 stdout
 - 同时通过 tq.send_warn 回推到通达信 TQ 策略信号窗口（TDX_SEND_WARN=0 可关闭）
 
 集成方式：
@@ -27,15 +27,14 @@ from typing import Dict, List, Set, Optional
 from datetime import datetime, timedelta, timezone, time as dtime
 from queue import Queue
 
+import feishu_push
+
 logger = logging.getLogger("alert_monitor")
 
 # === 飞书 webhook（如果设了）===
+# 保留这个常量：外部脚本可能读它。真正的发送由 feishu_push 负责
+# （走队列异步发，支持自建应用通道 + 群机器人 webhook 两条路）。
 FEISHU_WEBHOOK = os.environ.get("STOCK_FLOW_FEISHU_WEBHOOK", "").strip()
-if not FEISHU_WEBHOOK:
-    logger.warning(
-        "飞书 Webhook 未配置（环境变量 STOCK_FLOW_FEISHU_WEBHOOK 为空）。"
-        "异动推送将只输出到 stdout，不会发送到飞书。"
-    )
 
 # === 通达信 TQ 信号窗口回推（tq.send_warn）===
 # 默认开启；设 TDX_SEND_WARN=0 关闭。推送失败只记日志，绝不影响异动监测主流程。
@@ -283,24 +282,31 @@ class AlertDetector:
 # ============================================================
 # 飞书推送
 # ============================================================
+# 全部走 feishu_push 的队列：入队即返回，后台线程限速发送。
+# 为什么不再直接 requests.post —— 那玩意是同步的，跑在告警扫描线程/订阅线程里，
+# 外网一不通每条就阻塞 10 秒（实测峰值 193 条/60 秒 → 扫描线程最坏卡 32 分钟）。
+# 详见 feishu_push 模块头与巡检报告 P1-13。
 
 def send_feishu_text(text: str):
-    """发飞书 webhook 消息（如果配了）"""
-    if not FEISHU_WEBHOOK:
-        # 没配 webhook 时输出到 stdout（agent 能看到）
+    """把一段文本推给飞书（非阻塞：入队即返回）"""
+    if not feishu_push.is_configured():
+        # 没配任何通道时输出到 stdout（agent 能看到）
         print(f"\n{text}\n", flush=True)
-        return
-    try:
-        import requests
-        r = requests.post(
-            FEISHU_WEBHOOK,
-            json={"msg_type": "text", "content": {"text": text}},
-            timeout=10,
-        )
-        if r.status_code != 200:
-            logger.error("飞书通知失败: HTTP %s", r.status_code)
-    except Exception as e:
-        logger.error("飞书通知异常: %s", e)
+        return False
+    return feishu_push.enqueue_text(text)
+
+
+def send_feishu_alert(alert):
+    """把一条异动告警推给飞书（非阻塞：入队即返回）
+
+    走卡片格式 —— 异动量很大，纯文本在群里根本扫不出重点。
+    """
+    if not feishu_push.is_configured():
+        # 没配通道时退回 stdout，保留本地排查能力
+        print(f"\n{alert.to_markdown()}\n", flush=True)
+        return False
+    label = _ALERT_REASON_LABEL.get(alert.alert_type, alert.alert_type)
+    return feishu_push.notify_alert(alert, label=label)
 
 
 # ============================================================
@@ -763,9 +769,8 @@ class RealtimeAlertMonitor:
                 for alert in alerts:
                     if self.throttler.should_send(code, alert.alert_type,
                                                   price=alert.current_zaf):
-                        msg = alert.to_markdown()
                         logger.info("异动(扫描): %s %s", code, alert.alert_type)
-                        send_feishu_text(msg)
+                        send_feishu_alert(alert)
                         if send_warn_to_tdx(alert, info):
                             self._bump_stat('warn_sent')
                         self._bump_stat('alerts_sent')
@@ -793,9 +798,8 @@ class RealtimeAlertMonitor:
             for alert in alerts:
                 if self.throttler.should_send(code, alert.alert_type,
                                               price=alert.current_zaf):
-                    msg = alert.to_markdown()
                     logger.info("异动: %s %s", code, alert.alert_type)
-                    send_feishu_text(msg)
+                    send_feishu_alert(alert)
                     if send_warn_to_tdx(alert, info):
                         self._bump_stat('warn_sent')
                     self._bump_stat('alerts_sent')
