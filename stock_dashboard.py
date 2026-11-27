@@ -414,6 +414,22 @@ _INDEX_TAIL_CACHE = {}
 _INDEX_TAIL_TTL = 600.0
 _INDEX_TAIL_LOCK = threading.Lock()
 
+# akshare 的指数接口内部用 tqdm 往 stderr 打进度条。看板的 stderr 被重定向到
+# logs/dashboard.stderr.log —— 盘中每分钟刷一次会把它撑大。调用期间临时吞掉。
+_AKSHARE_STDERR_LOCK = threading.Lock()
+
+
+def _call_akshare_silent(fn, *args, **kwargs):
+    """调用 akshare 接口，屏蔽它内部的 tqdm 进度条输出"""
+    import io as _io
+    with _AKSHARE_STDERR_LOCK:
+        old = sys.stderr
+        sys.stderr = _io.StringIO()
+        try:
+            return fn(*args, **kwargs)
+        finally:
+            sys.stderr = old
+
 # 看板代码 -> 新浪源代码
 _INDEX_AKSHARE_SYMBOL = {
     "000001.SH": "sh000001",
@@ -433,7 +449,7 @@ def _fetch_index_tail_akshare(code):
             return hit["bars"]
     bars = []
     try:
-        df = ak.stock_zh_index_daily(symbol=symbol)
+        df = _call_akshare_silent(ak.stock_zh_index_daily, symbol=symbol)
         if df is not None and len(df):
             tail = df.tail(10)
             for _, row in tail.iterrows():
@@ -488,7 +504,7 @@ def _fetch_index_spot_today(code):
 
     bar = None
     try:
-        df = ak.stock_zh_index_spot_sina()
+        df = _call_akshare_silent(ak.stock_zh_index_spot_sina)
         row = df[df["代码"] == symbol]
         if len(row):
             r = row.iloc[0]
@@ -2292,21 +2308,23 @@ class Handler(BaseHTTPRequestHandler):
             hist = LATEST["history"]
             # names 从 LATEST["stock_top/industry_top/concept_top"] + history 字典 key 合并获取
             # 这样 history 里有但 TOP 列表里没有的 key（流出股、流出行业/概念）也能正确显示名字
-            stock_top = LATEST["stock_top"][:STOCK_TOP_N]
-            stock_bot = LATEST["stock_bottom"][:STOCK_TOP_N]
+            # 这些字段在纯 TDX 数据源下可能是 None（行业/概念榜要 akshare 才有）——
+            # 直接下标会抛 TypeError，前端每次拉趋势图都会断连（实测 107 次）
+            stock_top = (LATEST["stock_top"] or [])[:STOCK_TOP_N]
+            stock_bot = (LATEST["stock_bottom"] or [])[:STOCK_TOP_N]
             stock_nm = {str(r.get("股票代码", "")): str(r.get("股票简称", "")) for r in stock_top + stock_bot}
             for code in hist["stock"].keys():
                 if code not in stock_nm:
                     # history key 是股票代码本身，名字就用代码（兜底）
                     stock_nm[code] = code
-            industry_top = LATEST["industry_top"][:IND_TOP_N]
-            industry_bot = LATEST["industry_bottom"][:IND_TOP_N]
+            industry_top = (LATEST["industry_top"] or [])[:IND_TOP_N]
+            industry_bot = (LATEST["industry_bottom"] or [])[:IND_TOP_N]
             ind_nm = {str(r.get("行业", "")): str(r.get("行业", "")) for r in industry_top + industry_bot}
             for k in hist["industry"].keys():
                 if k not in ind_nm:
                     ind_nm[k] = k
-            concept_top = LATEST["concept_top"][:CONCEPT_TOP_N]
-            concept_bot = LATEST["concept_bottom"][:CONCEPT_TOP_N]
+            concept_top = (LATEST["concept_top"] or [])[:CONCEPT_TOP_N]
+            concept_bot = (LATEST["concept_bottom"] or [])[:CONCEPT_TOP_N]
             con_nm = {str(r.get("行业", "")): str(r.get("行业", "")) for r in concept_top + concept_bot}
             for k in hist["concept"].keys():
                 if k not in con_nm:
