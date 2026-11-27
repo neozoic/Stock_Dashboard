@@ -345,15 +345,14 @@
       if (ei < si) ei = si;                  // 区间末尾超出K线 -> 至少留一根
       var isCur = curBand && si === curBand[0] && ei === curBand[1];
       var base = b.type === "空头波段" ? COLOR_SHORT : COLOR_LONG;
+      // 当前区间用更深的填充色，但**不画边框**：区间很短时（比如只有 1~2 天）
+      // 边框是一条贯穿整个 grid 高度的竖线，跟 K 线的长影线长得一模一样
+      // —— 用户以为 K 线画错了（2026-11-26 实测踩到）
+      var fill = isCur
+        ? (b.type === "空头波段" ? COLOR_SHORT_STRONG : COLOR_LONG_STRONG)
+        : base;
       areas.push([
-        {
-          xAxis: si,
-          itemStyle: isCur
-            ? { color: b.type === "空头波段" ? COLOR_SHORT_STRONG : COLOR_LONG_STRONG,
-                borderColor: b.type === "空头波段" ? COLOR_DOWN : COLOR_UP,
-                borderWidth: 1.5 }
-            : { color: base }
-        },
+        { xAxis: si, itemStyle: { color: fill } },
         { xAxis: ei }
       ]);
     }
@@ -453,13 +452,20 @@
       ],
       series: [
         {
-          name: name, type: "candlestick", data: kdata,
-          itemStyle: { color: COLOR_UP, color0: COLOR_DOWN, borderColor: COLOR_UP, borderColor0: COLOR_DOWN },
-          markArea: { silent: true, data: areas }
+          name: name, type: "candlestick", data: kdata, z: 3,
+          itemStyle: { color: COLOR_UP, color0: COLOR_DOWN, borderColor: COLOR_UP, borderColor0: COLOR_DOWN }
         },
         {
           name: "成交量", type: "bar", xAxisIndex: 1, yAxisIndex: 1, data: vdata,
           itemStyle: { color: "rgba(79,156,249,.45)" }
+        },
+        {
+          // 区间背景色独立成一个 series，z 压到 K 线下面（z:3）——
+          // 原来 markArea 挂在 candlestick 上，总是画在 K 线**之上**，
+          // 窄区间会把最后一两根 K 线糊掉
+          name: "区间", type: "line", data: [], z: 1, silent: true,
+          xAxisIndex: 0, yAxisIndex: 0, showSymbol: false,
+          markArea: { silent: true, data: areas }
         }
       ]
     };
