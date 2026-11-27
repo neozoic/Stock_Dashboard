@@ -398,6 +398,83 @@ def _fnum(x):
     return round(f, 4)
 
 
+# ============================================================
+# 指数 K 线尾部补数
+# ============================================================
+# 通达信的本地日线是**盘后下载**的 —— 客户端没下完就一直缺最新一根。
+# 实测 2026-11-26：TDX 本地 sh000001.day 停在 11-25（写入时间 北京 01:29，
+# 早于当天收盘），图上就没有 26 号，而页面上的 0AMV 日期已经是 11-26，
+# 两个数据源不同步 → 用户看到"写着 26，图上却没有 26"。
+#
+# 补法：拿新浪源的指数日线，把 TDX 缺的尾部几根补上。
+#   - 新浪源全量拉一次约 1.3s（腾讯源 74s，太慢；东财源经常断连）
+#   - 结果缓存 10 分钟，避免每次刷新都打网络
+#   - **volume 单位要换算**：新浪是"股"，TDX 是"手"，差 100 倍
+_INDEX_TAIL_CACHE = {}
+_INDEX_TAIL_TTL = 600.0
+_INDEX_TAIL_LOCK = threading.Lock()
+
+# 看板代码 -> 新浪源代码
+_INDEX_AKSHARE_SYMBOL = {
+    "000001.SH": "sh000001",
+    "399006.SZ": "sz399006",
+}
+
+
+def _fetch_index_tail_akshare(code):
+    """取指数最近 10 根日线（新浪源，带缓存）。失败返回 []。"""
+    symbol = _INDEX_AKSHARE_SYMBOL.get(code)
+    if not symbol or not AK_OK:
+        return []
+    now = time.time()
+    with _INDEX_TAIL_LOCK:
+        hit = _INDEX_TAIL_CACHE.get(code)
+        if hit and now - hit["ts"] < _INDEX_TAIL_TTL:
+            return hit["bars"]
+    bars = []
+    try:
+        df = ak.stock_zh_index_daily(symbol=symbol)
+        if df is not None and len(df):
+            tail = df.tail(10)
+            for _, row in tail.iterrows():
+                d = str(row.get("date"))[:10]
+                vol = _fnum(row.get("volume"))
+                bars.append({
+                    "date": d,
+                    "open": _fnum(row.get("open")),
+                    "high": _fnum(row.get("high")),
+                    "low": _fnum(row.get("low")),
+                    "close": _fnum(row.get("close")),
+                    # 新浪的 volume 是"股"，TDX 是"手" —— 换算成手才对得上量纲
+                    "volume": round(vol / 100.0, 4) if vol is not None else None,
+                })
+    except Exception as e:
+        logger.warning("指数尾部补数失败(%s): %s", code, type(e).__name__)
+        return []
+    if bars:
+        with _INDEX_TAIL_LOCK:
+            _INDEX_TAIL_CACHE[code] = {"ts": now, "bars": bars}
+    return bars
+
+
+def _patch_index_tail(bars, code):
+    """把 TDX 缺的尾部几根用实时源补上。返回 (bars, 是否补过)"""
+    if not bars:
+        return bars, False
+    tail = _fetch_index_tail_akshare(code)
+    if not tail:
+        return bars, False
+    have = {b.get("date") for b in bars}
+    extra = [b for b in tail if b.get("date") not in have]
+    if not extra:
+        return bars, False
+    merged = bars + extra
+    merged.sort(key=lambda b: b.get("date") or "")
+    logger.info("指数 K 线补齐 %d 根(尾部): %s", len(extra),
+                ", ".join(b["date"] for b in extra))
+    return merged, True
+
+
 def _aggregate_by_year(bars):
     """日K -> 年K（开=首日开/高=期间最高/低=期间最低/收=末日收/量=合计）"""
     groups = {}
@@ -1727,6 +1804,11 @@ class Handler(BaseHTTPRequestHandler):
             return
         raw = bars.get(code) or {}
         out = _normalize_bars(raw)
+        patched = False
+        # 只有日 K 才补：周/月/年的最后一根由通达信按周期聚合，
+        # 补日线对不上它的口径（日 K 补齐后各周期自然覆盖）
+        if period == "day":
+            out, patched = _patch_index_tail(out, code)
         if period == "year":
             out = _aggregate_by_year(out)
         self._send_json_response(200, {
@@ -1735,6 +1817,10 @@ class Handler(BaseHTTPRequestHandler):
             "name": INDEX_CODES[code],
             "period": period,
             "count": len(out),
+            # K 线自己的最后日期 —— 前端要单独显示，不能跟 0AMV 的日期混用
+            "data_date": out[-1]["date"] if out else None,
+            # True = 尾部几根是用实时源补的（TDX 本地日线还没下完）
+            "tail_patched": patched,
             "bars": out,
         })
 
