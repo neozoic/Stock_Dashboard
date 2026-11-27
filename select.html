@@ -213,6 +213,10 @@
   var latest = null;    // 最新一天的 活跃/死筹/活跃占比
   var stateDays = null; // 当前区间已持续几个交易日
   var dailyMap = null;  // 日期 -> {close, chg}  0AMV 全量日线
+  // K 线自己的元信息 —— 大盘概览这张卡同时画 0AMV 区间和指数 K 线，
+  // 两个数据源不同步（0AMV 每天 20:00 更新，K 线走通达信本地日线，盘后才下载），
+  // 以前混用同一个"数据截至"，看起来就像 K 线少了当天那一根
+  var klineMeta = { dataDate: null, patched: false };
   var bandMap = null;   // 日期 -> 区间类型（多头区间/空头波段）
   var cur = { code: "000001.SH", period: "day" };
 
@@ -463,9 +467,16 @@
   }
 
   function updateMeta(name, n) {
-    document.getElementById("ov-meta").textContent = name + " · " + n + " 根K线";
+    // K 线自己的截止日期要显式写出来 —— 它是通达信本地日线，
+    // 盘后下载完成前会比 0AMV 少一天
+    var meta = name + " · " + n + " 根K线";
+    if (klineMeta.dataDate) meta += " · 截至 " + klineMeta.dataDate;
+    document.getElementById("ov-meta").textContent = meta;
     var note = document.getElementById("ov-note");
-    note.textContent = bands.length ? ("已标注 " + bands.length + " 段多/空区间") : "暂无区间标注";
+    var bits = [];
+    bits.push(bands.length ? ("已标注 " + bands.length + " 段多/空区间") : "暂无区间标注");
+    if (klineMeta.patched) bits.push("末尾新增K线取自实时源");
+    note.textContent = bits.join(" · ");
     renderBadge();
     renderStats();
   }
@@ -525,7 +536,11 @@
       if (latest.active_ratio !== null && latest.active_ratio !== undefined) {
         add("活跃占比", (latest.active_ratio * 100).toFixed(2) + "%", "mute");
       }
-      add("数据截至", fmtDate(latest.date) || "--", "mute");
+      // 明确写"0AMV 截至" —— 它和下面 K 线的日期是两个数据源，不能共用一个标签
+      add("0AMV 截至", fmtDate(latest.date) || "--", "mute");
+    }
+    if (klineMeta.dataDate) {
+      add("K线截至", klineMeta.dataDate, "mute");
     }
     box.innerHTML = items.join("");
   }
@@ -541,6 +556,8 @@
           document.getElementById("ov-meta").textContent = "加载失败：" + (d.message || d.error);
           return;
         }
+        klineMeta.dataDate = d.data_date || null;
+        klineMeta.patched = !!d.tail_patched;
         render(d.bars || [], d.name || cur.code, d.period || cur.period);
         updateMeta(d.name || cur.code, d.count || 0);
       })

@@ -134,6 +134,7 @@ python stock_dashboard.py
 | `/api/feishu/status` | GET | 飞书推送通道、队列深度、已发/失败/丢弃计数 |
 | `/api/feishu/test` | POST | 发一条飞书测试卡片（仅本机 loopback）|
 | `/api/shutdown` | POST | 优雅关停（仅本机 loopback）。**必须走它而不是 taskkill** —— 强杀会漏掉通达信 TQ 槽位，4 个烧光 TQ 就再也起不来 |
+| `/api/index/kline?code=000001.SH&period=day\|week\|month\|year` | GET | 指数 K 线。返回 `data_date`（K 线自己的最后日期）与 `tail_patched`（尾部是否用实时源补齐）|
 | `/api/minute?code=600519.SH&period=1m&count=N` | GET | 单股/板块 K线分时（TDX 本地数据；无数据返回空数组，TDX 不可用 503）|
 | `/api/indicator?code=600519.SH&formula=KDJ&arg=9,3,3` | GET | 内置公式指标（MA/KDJ/MACD/BOLL/VOL/RSI/WR/DMA/ASI；白名单外 400，TDX 不可用 503）|
 

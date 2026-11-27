@@ -457,6 +457,68 @@ def _fetch_index_tail_akshare(code):
     return bars
 
 
+def _period_key(date_str, period):
+    """日期 -> 所属周期键（年K='2026' / 月K='2026-11' / 周K=(2026,47) ISO周）"""
+    d = (date_str or "")[:10]
+    if period == "year":
+        return d[:4]
+    if period == "month":
+        return d[:7]
+    if period == "week":
+        try:
+            from datetime import date as _date
+            y, m, dd = (int(x) for x in d.split("-")[:3])
+            iso = _date(y, m, dd).isocalendar()
+            return (iso[0], iso[1])
+        except Exception:
+            return d
+    return d
+
+
+def _merge_last_period(bars, day_bars, period):
+    """用补过的日线重算周期K线的最后一根（周/月），必要时追加新周期。
+
+    TDX 的周期数据末根同样停在本地日线最后一天；补了日线之后，
+    周期数据也得跟着更新，否则切到周K/月K还是会缺今天。
+    """
+    if not bars or not day_bars:
+        return bars, False
+    last_key = _period_key(bars[-1]["date"], period)
+    groups = {}
+    for b in day_bars:
+        k = _period_key(b["date"], period)
+        # 只关心最后一根所在周期及之后
+        if isinstance(k, tuple) and isinstance(last_key, tuple):
+            if k < last_key:
+                continue
+        elif k < last_key:
+            continue
+        groups.setdefault(k, []).append(b)
+    if not groups:
+        return bars, False
+    # 只有补的日线**覆盖了**末根所在周期时才替换掉它；
+    # 否则（日线里没有那一段）保留原末根，直接往后追加新周期
+    out = bars[:-1] if last_key in groups else list(bars)
+    changed = False
+    for k in sorted(groups):
+        g = groups[k]
+        high = max((x["high"] for x in g if x.get("high") is not None), default=None)
+        low = min((x["low"] for x in g if x.get("low") is not None), default=None)
+        vol = sum((x.get("volume") or 0) for x in g)
+        merged = {
+            "date": g[-1]["date"],
+            "open": g[0]["open"],
+            "high": high,
+            "low": low,
+            "close": g[-1]["close"],
+            "volume": round(vol, 4),
+        }
+        if merged["date"] != bars[-1]["date"] or len(g) > 1:
+            changed = True
+        out.append(merged)
+    return out, changed
+
+
 def _patch_index_tail(bars, code):
     """把 TDX 缺的尾部几根用实时源补上。返回 (bars, 是否补过)"""
     if not bars:
@@ -1805,10 +1867,20 @@ class Handler(BaseHTTPRequestHandler):
         raw = bars.get(code) or {}
         out = _normalize_bars(raw)
         patched = False
-        # 只有日 K 才补：周/月/年的最后一根由通达信按周期聚合，
-        # 补日线对不上它的口径（日 K 补齐后各周期自然覆盖）
-        if period == "day":
+        # y/n 都要补：year 本身就是按日线聚合的，先把日线尾部补齐再聚合；
+        # week/month 走 TDX 的原生周期数据，末根同样停在本地日线最后一天，
+        # 需要用补过的日线重算末根
+        if period in ("day", "year"):
             out, patched = _patch_index_tail(out, code)
+        elif period in ("week", "month"):
+            try:
+                day_raw = tdx_client.get_minute_bars([code], period="1d", count=400)
+                day_bars = _normalize_bars((day_raw or {}).get(code) or {})
+                day_bars, patched = _patch_index_tail(day_bars, code)
+                if patched:
+                    out, _ = _merge_last_period(out, day_bars, period)
+            except Exception as e:
+                logger.warning("周期K线末根重算失败(%s/%s): %s", code, period, e)
         if period == "year":
             out = _aggregate_by_year(out)
         self._send_json_response(200, {
