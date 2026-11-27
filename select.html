@@ -351,9 +351,12 @@
       var fill = isCur
         ? (b.type === "空头波段" ? COLOR_SHORT_STRONG : COLOR_LONG_STRONG)
         : base;
+      // 用 ±0.5 覆盖整根 bar：类别轴下索引 i 表示第 i 根 bar 的**中心**，
+      // 只画 [si, ei] 时单日区间宽度为 0 —— 完全看不见。
+      // 当前多头区间只有 2026-11-27 一天，背景色带因此消失（实测踩到）
       areas.push([
-        { xAxis: si, itemStyle: { color: fill } },
-        { xAxis: ei }
+        { xAxis: si - 0.5, itemStyle: { color: fill } },
+        { xAxis: ei + 0.5 }
       ]);
     }
     return areas;
@@ -377,10 +380,19 @@
   }
 
   function render(bars, name, period) {
-    var dates = bars.map(function (b) { return b.date; });
-    var kdata = bars.map(function (b) { return [b.open, b.close, b.low, b.high]; });
-    var vdata = bars.map(function (b) { return b.volume; });
-    var areas = buildMarkArea(dates, period || cur.period);
+    var realDates = bars.map(function (b) { return b.date; });
+    // 区间色带要用**真实日期**算（末尾补的空位会让 last 变成空串）
+    var areas = buildMarkArea(realDates, period || cur.period);
+
+    // 末尾补 1 个空类目：
+    //   ① 拖到最右时最后一根 K 线不贴边，右侧有留白
+    //   ② 更重要 —— 类别轴的 xAxis 上限是 (n-0.5)。markArea 要画到
+    //      最后一根右侧就得用 ei+0.5，正好越界被 ECharts 整个丢弃，
+    //      于是"只有一天的多头区间"背景完全看不见（2026-11-27 实测踩到）
+    //      补一个空位后上限变成 n+0.5，ei+0.5 就落在范围内了
+    var dates = realDates.concat([""]);
+    var kdata = bars.map(function (b) { return [b.open, b.close, b.low, b.high]; }).concat(["-"]);
+    var vdata = bars.map(function (b) { return b.volume; }).concat([null]);
 
     var opt = {
       animation: false,
@@ -398,7 +410,10 @@
           if (!params || !params.length) return "";
           var p = params[0];
           var dateStr = p.axisValue || "";
-          var k = p.data;               // candlestick: [open, close, low, high]
+          // ⚠️ 不要用 p.data：category 轴下 ECharts 会把它变成
+          //    [索引, open, close, low, high] 五元组 —— 直接按 4 元组取会整体错位
+          //    （实测 tooltip 显示"开 1501.00"，1501 其实是 dataIndex）
+          var k = kdata[p.dataIndex] || p.data;
           if (!k || !k.length) return "";
           var idx = p.dataIndex;
           var chg = oamvChangeFor(dates, idx);
@@ -422,8 +437,10 @@
       },
       legend: { data: [name], top: 0, textStyle: { color: "#c6cdd9", fontSize: 11 } },
       grid: [
-        { left: 58, right: 24, top: 26, height: "58%" },
-        { left: 58, right: 24, top: "74%", height: "16%" }
+        // right 留够空间：dataZoom 拖到最右(end=100)时最后一根 K 线贴着边缘，
+        // 背景色带会被裁掉一半 —— 留 64px 让它完整显示
+        { left: 58, right: 64, top: 26, height: "58%" },
+        { left: 58, right: 64, top: "74%", height: "16%" }
       ],
       xAxis: [
         { type: "category", data: dates, gridIndex: 0, boundaryGap: true,
