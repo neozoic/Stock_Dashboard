@@ -457,6 +457,66 @@ def _fetch_index_tail_akshare(code):
     return bars
 
 
+_INDEX_SPOT_CACHE = {}
+_INDEX_SPOT_TTL = 60.0
+
+
+def _fetch_index_spot_today(code):
+    """盘中取指数实时快照，拼成**当天**的动态 K 线。不适用时返回 None。
+
+    为什么需要：通达信本地日线是盘后才下载的，新浪的**日线**接口盘中也不
+    更新当天 —— 所以盘中图上永远看不到今天这根。但新浪的**实时快照**接口
+    有今开/最高/最低/最新价/成交量，足够拼出当天的 bar。
+    """
+    symbol = _INDEX_AKSHARE_SYMBOL.get(code)
+    if not symbol or not AK_OK:
+        return None
+    bj = datetime.now(BJ_TZ)
+    hm = bj.hour * 60 + bj.minute
+    # 09:15(集合竞价) 之后才认为"今天可能是交易日"。
+    # 不设上限：收盘后到日线源更新前（通常 15:30~16:00）也得靠快照顶住，
+    # 否则那段时间当天 K 线会先消失再出现。
+    # 9:15 之前必须排除 —— 那时快照返回的是**上一交易日**的数据，
+    # 直接标成今天会凭空造出一根假 K 线
+    if bj.weekday() >= 5 or hm < 9 * 60 + 15:
+        return None
+    now_ts = time.time()
+    with _INDEX_TAIL_LOCK:
+        hit = _INDEX_SPOT_CACHE.get(code)
+        if hit and now_ts - hit["ts"] < _INDEX_SPOT_TTL:
+            return hit["bar"]
+
+    bar = None
+    try:
+        df = ak.stock_zh_index_spot_sina()
+        row = df[df["代码"] == symbol]
+        if len(row):
+            r = row.iloc[0]
+            o = _fnum(r.get("今开"))
+            hi = _fnum(r.get("最高"))
+            lo = _fnum(r.get("最低"))
+            last = _fnum(r.get("最新价"))
+            prev = _fnum(r.get("昨收"))
+            vol = _fnum(r.get("成交量"))
+            if o and hi and lo and last:
+                # 未开盘/节假日：快照返回的是上一交易日收盘（四价合一且等于昨收）
+                # —— 那就不是"今天"的 K 线，不能加进去
+                flat = (o == hi == lo == last)
+                if not (flat and prev and abs(last - prev) < 1e-9):
+                    bar = {
+                        "date": bj.strftime("%Y-%m-%d"),
+                        "open": o, "high": hi, "low": lo, "close": last,
+                        # 新浪实时快照的成交量与 TDX 同为"手"，不用换算
+                        "volume": vol,
+                    }
+    except Exception as e:
+        logger.warning("指数实时快照失败(%s): %s", code, type(e).__name__)
+        return None
+    with _INDEX_TAIL_LOCK:
+        _INDEX_SPOT_CACHE[code] = {"ts": now_ts, "bar": bar}
+    return bar
+
+
 def _period_key(date_str, period):
     """日期 -> 所属周期键（年K='2026' / 月K='2026-11' / 周K=(2026,47) ISO周）"""
     d = (date_str or "")[:10]
@@ -523,11 +583,14 @@ def _patch_index_tail(bars, code):
     """把 TDX 缺的尾部几根用实时源补上。返回 (bars, 是否补过)"""
     if not bars:
         return bars, False
-    tail = _fetch_index_tail_akshare(code)
-    if not tail:
-        return bars, False
     have = {b.get("date") for b in bars}
-    extra = [b for b in tail if b.get("date") not in have]
+    extra = [b for b in (_fetch_index_tail_akshare(code) or [])
+             if b.get("date") not in have]
+    # 盘中：日线源都还没今天的，用实时快照把当天这根拼出来。
+    # 注意不能因为日线源失败就跳过这里（两者是独立的数据通道）
+    spot = _fetch_index_spot_today(code)
+    if spot and spot["date"] not in have:
+        extra.append(spot)
     if not extra:
         return bars, False
     merged = bars + extra
