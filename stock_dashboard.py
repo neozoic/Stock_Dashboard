@@ -600,17 +600,32 @@ def _patch_index_tail(bars, code):
     if not bars:
         return bars, False
     have = {b.get("date") for b in bars}
-    extra = [b for b in (_fetch_index_tail_akshare(code) or [])
-             if b.get("date") not in have]
-    # 盘中：日线源都还没今天的，用实时快照把当天这根拼出来。
+    extra = []
+    # 日线源优先（收盘后它就是最终值）。
+    # ⚠️ 每加一条都要同步更新 have —— 否则下面快照通道会把同一天再加一遍，
+    # 图上出现两根 11-27（2026-11-27 实测踩到）
+    for b in (_fetch_index_tail_akshare(code) or []):
+        if b.get("date") not in have:
+            extra.append(b)
+            have.add(b["date"])
+    # 盘中：日线源还没今天的，用实时快照把当天这根拼出来。
     # 注意不能因为日线源失败就跳过这里（两者是独立的数据通道）
     spot = _fetch_index_spot_today(code)
     if spot and spot["date"] not in have:
         extra.append(spot)
+        have.add(spot["date"])
     if not extra:
         return bars, False
     merged = bars + extra
-    merged.sort(key=lambda b: b.get("date") or "")
+    # 兜底去重：同一日期只留一条（后面的视为更新）。
+    # 不依赖上面的 have 逻辑 —— 万一 TDX 自身就带了重复日期，
+    # 这里也能拦住，图上不会出现并排两根同日 K 线
+    dedup = {}
+    for b in merged:
+        d = b.get("date")
+        if d:
+            dedup[d] = b
+    merged = sorted(dedup.values(), key=lambda b: b.get("date") or "")
     logger.info("指数 K 线补齐 %d 根(尾部): %s", len(extra),
                 ", ".join(b["date"] for b in extra))
     return merged, True
