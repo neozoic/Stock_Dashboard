@@ -105,7 +105,8 @@
   }
   .ov-controls select:hover { border-color: var(--border-hover); }
   .ov-note { font-size: 11px; color: var(--muted); }
-  .chart-box { width: 100%; height: 460px; }
+  /* K线 + 成交量 + MACD + KDJ 四个区，460px 太挤 */
+  .chart-box { width: 100%; height: 620px; }
   .placeholder {
     border: 1px dashed var(--border-hover); border-radius: var(--radius);
     padding: 44px 24px; text-align: center; color: var(--muted);
@@ -307,6 +308,56 @@
   //   周K 的 bar 日期是该周**最后**交易日，月K/年K 同理；
   //   所以短区间（如只到周三）在周K 上直接用 bar 日期比较会整个丢掉，
   //   必须按"周期有重叠就算"来判定。
+  // ============ 技术指标（前端就地计算，不额外发请求） ============
+  // EMA：遇到 null 跳过（MACD 的 DIF 序列开头是 null）
+  function emaWithNull(arr, n) {
+    var k = 2 / (n + 1), out = [], prev = null;
+    for (var i = 0; i < arr.length; i++) {
+      var v = arr[i];
+      if (v === null || v === undefined || !isFinite(v)) { out.push(null); continue; }
+      prev = (prev === null) ? v : (v * k + prev * (1 - k));
+      out.push(prev);
+    }
+    return out;
+  }
+
+  function r2(v) { return (v === null || !isFinite(v)) ? null : Math.round(v * 100) / 100; }
+
+  // MACD(12,26,9)：DIF = EMA12-EMA26，DEA = EMA9(DIF)，柱 = (DIF-DEA)*2
+  function calcMACD(closes, fast, slow, signal) {
+    fast = fast || 12; slow = slow || 26; signal = signal || 9;
+    var ef = emaWithNull(closes, fast), es = emaWithNull(closes, slow);
+    var dif = [], dea, hist = [], i;
+    for (i = 0; i < closes.length; i++) {
+      dif.push((ef[i] === null || es[i] === null) ? null : ef[i] - es[i]);
+    }
+    dea = emaWithNull(dif, signal);
+    for (i = 0; i < closes.length; i++) {
+      hist.push((dif[i] === null || dea[i] === null) ? null : (dif[i] - dea[i]) * 2);
+    }
+    return { dif: dif, dea: dea, hist: hist };
+  }
+
+  // KDJ(9,3,3)：RSV=(C-Ln)/(Hn-Ln)*100，K=SMA(RSV,3,1)，D=SMA(K,3,1)，J=3K-2D
+  function calcKDJ(bars, n, m1, m2) {
+    n = n || 9; m1 = m1 || 3; m2 = m2 || 3;
+    var K = [], D = [], J = [], pk = 50, pd = 50;
+    for (var i = 0; i < bars.length; i++) {
+      var lo = Infinity, hi = -Infinity;
+      for (var j = Math.max(0, i - n + 1); j <= i; j++) {
+        var bl = bars[j].low, bh = bars[j].high;
+        if (bl !== null && bl !== undefined && bl < lo) lo = bl;
+        if (bh !== null && bh !== undefined && bh > hi) hi = bh;
+      }
+      var rsv = (!isFinite(hi) || hi === lo) ? 50
+              : (bars[i].close - lo) / (hi - lo) * 100;
+      pk = (rsv + (m1 - 1) * pk) / m1;
+      pd = (pk + (m2 - 1) * pd) / m2;
+      K.push(r2(pk)); D.push(r2(pd)); J.push(r2(3 * pk - 2 * pd));
+    }
+    return { K: K, D: D, J: J };
+  }
+
   function periodOffset(period) {
     if (period === "week") return 7;
     if (period === "month") return 32;
@@ -394,6 +445,13 @@
     var kdata = bars.map(function (b) { return [b.open, b.close, b.low, b.high]; }).concat(["-"]);
     var vdata = bars.map(function (b) { return b.volume; }).concat([null]);
 
+    // MACD / KDJ：用真实 bars 算，末尾同样补 null 对齐空位
+    var closes = bars.map(function (b) { return b.close; });
+    var macd = calcMACD(closes);
+    var kdj = calcKDJ(bars);
+    macd.dif.push(null); macd.dea.push(null); macd.hist.push(null);
+    kdj.K.push(null); kdj.D.push(null); kdj.J.push(null);
+
     var opt = {
       animation: false,
       backgroundColor: "transparent",
@@ -408,7 +466,12 @@
         extraCssText: "max-width:380px;white-space:normal;box-shadow:0 8px 24px rgba(0,0,0,.45);border-radius:8px;",
         formatter: function (params) {
           if (!params || !params.length) return "";
-          var p = params[0];
+          // 加了 MACD/KDJ 之后 params 里有多个 series，必须挑出 K 线那一条
+          var p = null;
+          for (var pi = 0; pi < params.length; pi++) {
+            if (params[pi].seriesType === "candlestick") { p = params[pi]; break; }
+          }
+          if (!p) p = params[0];
           var dateStr = p.axisValue || "";
           // ⚠️ 不要用 p.data：category 轴下 ECharts 会把它变成
           //    [索引, open, close, low, high] 五元组 —— 直接按 4 元组取会整体错位
@@ -432,21 +495,51 @@
                     'border-top:1px solid rgba(255,255,255,.12);color:' + bandColor +
                     ';font-weight:600">0AMV 涨跌 ' + fmtPct(chg) + "</div>";
           }
+          // 指标值（与下方副图对应）
+          var mv = macd.hist[idx], mdi = macd.dif[idx], mde = macd.dea[idx];
+          if (mdi !== null && mdi !== undefined) {
+            var mc = (mv >= 0) ? COLOR_UP : COLOR_DOWN;
+            html += '<div style="margin-top:5px;padding-top:5px;' +
+                    'border-top:1px solid rgba(255,255,255,.12);font-size:11px">' +
+                    '<span style="color:#f0b90b">DIF ' + fmtNum(mdi) + "</span>　" +
+                    '<span style="color:#4f9cf9">DEA ' + fmtNum(mde) + "</span>　" +
+                    '<span style="color:' + mc + '">MACD ' + fmtNum(mv) + "</span></div>";
+          }
+          var kv = kdj.K[idx], dv = kdj.D[idx], jv = kdj.J[idx];
+          if (kv !== null && kv !== undefined) {
+            html += '<div style="font-size:11px;margin-top:2px">' +
+                    '<span style="color:#ff9f43">K ' + fmtNum(kv) + "</span>　" +
+                    '<span style="color:#4f9cf9">D ' + fmtNum(dv) + "</span>　" +
+                    '<span style="color:#c678dd">J ' + fmtNum(jv) + "</span></div>";
+          }
           return html;
         }
       },
-      legend: { data: [name], top: 0, textStyle: { color: "#c6cdd9", fontSize: 11 } },
+      legend: {
+        data: [name, "DIF", "DEA", "K", "D", "J"], top: 0,
+        itemWidth: 10, itemHeight: 8, itemGap: 10,
+        textStyle: { color: "#c6cdd9", fontSize: 11 }
+      },
       grid: [
         // right 留够空间：dataZoom 拖到最右(end=100)时最后一根 K 线贴着边缘，
         // 背景色带会被裁掉一半 —— 留 64px 让它完整显示
-        { left: 58, right: 64, top: 26, height: "58%" },
-        { left: 58, right: 64, top: "74%", height: "16%" }
+        { left: 58, right: 64, top: 24, height: "34%" },     // K 线
+        { left: 58, right: 64, top: "43%", height: "10%" },  // 成交量
+        { left: 58, right: 64, top: "57%", height: "11%" },  // MACD
+        { left: 58, right: 64, top: "72%", height: "11%" }   // KDJ
       ],
       xAxis: [
         { type: "category", data: dates, gridIndex: 0, boundaryGap: true,
           axisLabel: { show: false }, axisLine: { lineStyle: { color: COLOR_AXIS } },
           axisTick: { show: false }, splitLine: { show: false } },
         { type: "category", data: dates, gridIndex: 1, boundaryGap: true,
+          axisLabel: { show: false }, axisLine: { lineStyle: { color: COLOR_AXIS } },
+          axisTick: { show: false }, splitLine: { show: false } },
+        { type: "category", data: dates, gridIndex: 2, boundaryGap: true,
+          axisLabel: { show: false }, axisLine: { lineStyle: { color: COLOR_AXIS } },
+          axisTick: { show: false }, splitLine: { show: false } },
+        // 日期标签放在最下面一格（KDJ）
+        { type: "category", data: dates, gridIndex: 3, boundaryGap: true,
           axisLabel: { color: COLOR_MUTED, fontSize: 10 },
           axisLine: { lineStyle: { color: COLOR_AXIS } },
           axisTick: { show: false }, splitLine: { show: false } }
@@ -456,14 +549,30 @@
           nameTextStyle: { color: COLOR_MUTED, fontSize: 10 },
           axisLabel: { color: COLOR_MUTED, fontSize: 10 },
           splitLine: { lineStyle: { color: COLOR_AXIS } } },
-        { scale: true, gridIndex: 1, name: "量",
+        { scale: true, gridIndex: 1, name: "量", splitNumber: 2,
+          nameTextStyle: { color: COLOR_MUTED, fontSize: 10 },
+          axisLabel: {
+            color: COLOR_MUTED, fontSize: 10,
+            // 成交量原始值是 4.5 亿级的整数，直接显示会挤成一串
+            formatter: function (v) {
+              if (Math.abs(v) >= 1e8) return (v / 1e8).toFixed(1) + "亿";
+              if (Math.abs(v) >= 1e4) return (v / 1e4).toFixed(0) + "万";
+              return v;
+            }
+          },
+          splitLine: { show: false } },
+        { scale: true, gridIndex: 2, name: "MACD", splitNumber: 2,
+          nameTextStyle: { color: COLOR_MUTED, fontSize: 10 },
+          axisLabel: { color: COLOR_MUTED, fontSize: 10 },
+          splitLine: { show: false } },
+        { scale: true, gridIndex: 3, name: "KDJ", splitNumber: 3,
           nameTextStyle: { color: COLOR_MUTED, fontSize: 10 },
           axisLabel: { color: COLOR_MUTED, fontSize: 10 },
           splitLine: { show: false } }
       ],
       dataZoom: [
-        { type: "inside", xAxisIndex: [0, 1], start: 60, end: 100 },
-        { type: "slider", xAxisIndex: [0, 1], bottom: 4, height: 16,
+        { type: "inside", xAxisIndex: [0, 1, 2, 3], start: 60, end: 100 },
+        { type: "slider", xAxisIndex: [0, 1, 2, 3], bottom: 4, height: 16,
           borderColor: COLOR_AXIS, backgroundColor: "transparent",
           textStyle: { color: COLOR_MUTED, fontSize: 10 } }
       ],
@@ -483,6 +592,45 @@
           name: "区间", type: "line", data: [], z: 1, silent: true,
           xAxisIndex: 0, yAxisIndex: 0, showSymbol: false,
           markArea: { silent: true, data: areas }
+        },
+        // ---------- MACD ----------
+        {
+          name: "MACD", type: "bar", xAxisIndex: 2, yAxisIndex: 2, data: macd.hist,
+          barMaxWidth: 6,
+          itemStyle: {
+            color: function (prm) {
+              // 正红负绿，与 K 线配色一致（A 股红涨绿跌）
+              var v = prm.value;
+              return (v === null || v === undefined || v >= 0) ? COLOR_UP : COLOR_DOWN;
+            }
+          }
+        },
+        {
+          name: "DIF", type: "line", xAxisIndex: 2, yAxisIndex: 2, data: macd.dif,
+          showSymbol: false, lineStyle: { width: 1.2, color: "#f0b90b" },
+          itemStyle: { color: "#f0b90b" }
+        },
+        {
+          name: "DEA", type: "line", xAxisIndex: 2, yAxisIndex: 2, data: macd.dea,
+          showSymbol: false, lineStyle: { width: 1.2, color: "#4f9cf9" },
+          itemStyle: { color: "#4f9cf9" }
+        },
+        // ---------- KDJ ----------
+        {
+          // K 用橙色 —— 和 MACD 的 DIF(黄) 区分开，否则图例上看不出差别
+          name: "K", type: "line", xAxisIndex: 3, yAxisIndex: 3, data: kdj.K,
+          showSymbol: false, lineStyle: { width: 1.2, color: "#ff9f43" },
+          itemStyle: { color: "#ff9f43" }
+        },
+        {
+          name: "D", type: "line", xAxisIndex: 3, yAxisIndex: 3, data: kdj.D,
+          showSymbol: false, lineStyle: { width: 1.2, color: "#4f9cf9" },
+          itemStyle: { color: "#4f9cf9" }
+        },
+        {
+          name: "J", type: "line", xAxisIndex: 3, yAxisIndex: 3, data: kdj.J,
+          showSymbol: false, lineStyle: { width: 1.2, color: "#c678dd" },
+          itemStyle: { color: "#c678dd" }
         }
       ]
     };
